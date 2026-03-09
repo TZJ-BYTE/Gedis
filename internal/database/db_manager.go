@@ -3,8 +3,8 @@ package database
 import (
 	"sync"
 	
-	"github.com/tzj/Gedis/config"
-	"github.com/tzj/Gedis/pkg/logger"
+	"github.com/TZJ-BYTE/RediGo/config"
+	"github.com/TZJ-BYTE/RediGo/pkg/logger"
 )
 
 // DBManager 数据库管理器

@@ -3,10 +3,10 @@ package command_test
 import (
 	"testing"
 	
-	"github.com/tzj/Gedis/config"
-	"github.com/tzj/Gedis/internal/command"
-	"github.com/tzj/Gedis/internal/datastruct"
-	"github.com/tzj/Gedis/internal/database"
+	"github.com/TZJ-BYTE/RediGo/config"
+	"github.com/TZJ-BYTE/RediGo/internal/command"
+	"github.com/TZJ-BYTE/RediGo/internal/datastruct"
+	"github.com/TZJ-BYTE/RediGo/internal/database"
 )
 
 func TestSetAndGet(t *testing.T) {

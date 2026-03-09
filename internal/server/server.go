@@ -6,11 +6,11 @@ import (
 	"io"
 	"net"
 	
-	"github.com/tzj/Gedis/config"
-	"github.com/tzj/Gedis/internal/command"
-	"github.com/tzj/Gedis/internal/database"
-	"github.com/tzj/Gedis/internal/protocol"
-	"github.com/tzj/Gedis/pkg/logger"
+	"github.com/TZJ-BYTE/RediGo/config"
+	"github.com/TZJ-BYTE/RediGo/internal/command"
+	"github.com/TZJ-BYTE/RediGo/internal/database"
+	"github.com/TZJ-BYTE/RediGo/internal/protocol"
+	"github.com/TZJ-BYTE/RediGo/pkg/logger"
 )
 
 // Server Redis 服务器

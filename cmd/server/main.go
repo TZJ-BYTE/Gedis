@@ -6,9 +6,9 @@ import (
 	"os/signal"
 	"syscall"
 	
-	"github.com/tzj/Gedis/config"
-	"github.com/tzj/Gedis/internal/server"
-	"github.com/tzj/Gedis/pkg/logger"
+	"github.com/TZJ-BYTE/RediGo/config"
+	"github.com/TZJ-BYTE/RediGo/internal/server"
+	"github.com/TZJ-BYTE/RediGo/pkg/logger"
 )
 
 func main() {

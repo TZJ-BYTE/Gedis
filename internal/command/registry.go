@@ -4,8 +4,8 @@ import (
 	"errors"
 	"strings"
 	
-	"github.com/tzj/Gedis/internal/database"
-	"github.com/tzj/Gedis/internal/protocol"
+	"github.com/TZJ-BYTE/RediGo/internal/database"
+	"github.com/TZJ-BYTE/RediGo/internal/protocol"
 )
 
 // CommandRegistry 命令注册表
@@ -63,4 +63,18 @@ func InitDefaultCommands() {
 	DefaultRegistry.Register("RPOP", &RPopCommand{})
 	DefaultRegistry.Register("LLEN", &LLenCommand{})
 	DefaultRegistry.Register("LRANGE", &LRangeCommand{})
+	
+	// 哈希命令
+	DefaultRegistry.Register("HSET", &HSetCommand{})
+	DefaultRegistry.Register("HGET", &HGetCommand{})
+	DefaultRegistry.Register("HMSET", &HMSetCommand{})
+	DefaultRegistry.Register("HMGET", &HMGetCommand{})
+	DefaultRegistry.Register("HDEL", &HDelCommand{})
+	DefaultRegistry.Register("HLEN", &HLenCommand{})
+	DefaultRegistry.Register("HEXISTS", &HExistsCommand{})
+	DefaultRegistry.Register("HKEYS", &HKeysCommand{})
+	DefaultRegistry.Register("HVALS", &HValsCommand{})
+	DefaultRegistry.Register("HGETALL", &HGetAllCommand{})
+	DefaultRegistry.Register("HINCRBY", &HIncrByCommand{})
+	DefaultRegistry.Register("HINCRBYFLOAT", &HIncrByFloatCommand{})
 }

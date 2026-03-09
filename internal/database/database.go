@@ -3,7 +3,7 @@ package database
 import (
 	"sync"
 	
-	"github.com/tzj/Gedis/internal/datastruct"
+	"github.com/TZJ-BYTE/RediGo/internal/datastruct"
 )
 
 // Database 数据库结构

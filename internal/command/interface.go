@@ -1,8 +1,8 @@
 package command
 
 import (
-	"github.com/tzj/Gedis/internal/database"
-	"github.com/tzj/Gedis/internal/protocol"
+	"github.com/TZJ-BYTE/RediGo/internal/database"
+	"github.com/TZJ-BYTE/RediGo/internal/protocol"
 )
 
 // Command 命令接口

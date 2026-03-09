@@ -4,9 +4,9 @@ import (
 	"errors"
 	"strconv"
 	
-	"github.com/tzj/Gedis/internal/datastruct"
-	"github.com/tzj/Gedis/internal/database"
-	"github.com/tzj/Gedis/internal/protocol"
+	"github.com/TZJ-BYTE/RediGo/internal/datastruct"
+	"github.com/TZJ-BYTE/RediGo/internal/database"
+	"github.com/TZJ-BYTE/RediGo/internal/protocol"
 )
 
 // LPushCommand LPUSH 命令
