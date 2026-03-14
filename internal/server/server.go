@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"time"
 	
 	"github.com/TZJ-BYTE/RediGo/config"
 	"github.com/TZJ-BYTE/RediGo/internal/command"
@@ -27,6 +28,9 @@ type Server struct {
 func NewServer(cfg *config.Config) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	
+	// 初始化命令注册表
+	command.InitDefaultCommands()
+	
 	return &Server{
 		config:    cfg,
 		dbManager: database.NewDBManager(cfg),
@@ -47,9 +51,6 @@ func (s *Server) Start() error {
 	
 	s.listener = listener
 	logger.Info("Gedis 服务器启动在 %s", addr)
-	
-	// 初始化命令
-	command.InitDefaultCommands()
 	
 	for {
 		conn, err := listener.Accept()
@@ -135,11 +136,43 @@ func (s *Server) handleSelectCommand(conn net.Conn, db *database.Database, args 
 
 // Stop 停止服务器
 func (s *Server) Stop() {
+	logger.Info("=== Server Stop called ===")
+	
 	s.cancel()
 	
+	// 异步关闭 listener，设置超时避免阻塞
 	if s.listener != nil {
-		s.listener.Close()
+		logger.Info("Closing listener with timeout...")
+		done := make(chan struct{})
+		go func() {
+			err := s.listener.Close()
+			if err != nil {
+				logger.Warn("Error closing listener: %v", err)
+			} else {
+				logger.Info("Listener closed successfully")
+			}
+			close(done)
+		}()
+		
+		// 等待最多 1 秒
+		select {
+		case <-done:
+			// Listener 已关闭
+		case <-time.After(1 * time.Second):
+			logger.Warn("Listener close timeout, continuing shutdown...")
+		}
 	}
 	
-	logger.Info("Gedis 服务器已停止")
+	// 关闭数据库管理器（会关闭所有数据库和 LSM 引擎）
+	if s.dbManager != nil {
+		logger.Info("Closing database manager...")
+		err := s.dbManager.Close()
+		if err != nil {
+			logger.Error("Failed to close database manager: %v", err)
+		} else {
+			logger.Info("Database manager closed successfully")
+		}
+	}
+	
+	logger.Info("=== Gedis 服务器已停止 ===")
 }

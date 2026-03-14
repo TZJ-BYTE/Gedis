@@ -56,6 +56,25 @@ func InitDefaultCommands() {
 	DefaultRegistry.Register("FLUSHDB", &FlushDBCommand{})
 	DefaultRegistry.Register("DBSIZE", &DBSizeCommand{})
 	
+	// 连接测试命令
+	DefaultRegistry.Register("PING", &PingCommand{})
+	
+	// 过期时间命令
+	DefaultRegistry.Register("TTL", &TtlCommand{})
+	DefaultRegistry.Register("PTTL", &PttlCommand{})
+	
+	// 原子增减命令
+	DefaultRegistry.Register("INCR", &IncrCommand{})
+	DefaultRegistry.Register("DECR", &DecrCommand{})
+	
+	// 批量操作命令
+	DefaultRegistry.Register("MSET", &MsetCommand{})
+	DefaultRegistry.Register("MGET", &MgetCommand{})
+	
+	// 重命名命令
+	DefaultRegistry.Register("RENAME", &RenameCommand{})
+	DefaultRegistry.Register("RENAMENX", &RenamenxCommand{})
+	
 	// 列表命令
 	DefaultRegistry.Register("LPUSH", &LPushCommand{})
 	DefaultRegistry.Register("RPUSH", &RPushCommand{})

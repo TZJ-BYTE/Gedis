@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 	
 	"github.com/TZJ-BYTE/RediGo/config"
 	"github.com/TZJ-BYTE/RediGo/internal/server"
@@ -27,21 +28,23 @@ func main() {
 	// 创建服务器
 	srv := server.NewServer(cfg)
 	
-	// 处理信号
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	
+	// 启动服务器（在 goroutine 中）
 	go func() {
-		<-sigChan
-		logger.Info("收到退出信号，正在关闭...")
-		srv.Stop()
-		os.Exit(0)
+		if err := srv.Start(); err != nil {
+			logger.Error("服务器启动失败：%v", err)
+			fmt.Printf("服务器启动失败：%v\n", err)
+			os.Exit(1)
+		}
 	}()
 	
-	// 启动服务器
-	if err := srv.Start(); err != nil {
-		logger.Error("服务器启动失败：%v", err)
-		fmt.Printf("服务器启动失败：%v\n", err)
-		os.Exit(1)
-	}
+	// 等待退出信号（阻塞）
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	<-sigChan
+	
+	logger.Info("收到退出信号，正在关闭...")
+	srv.Stop()
+	// 等待日志 flush
+	time.Sleep(200 * time.Millisecond)
+	logger.Info("程序退出")
 }

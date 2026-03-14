@@ -1,9 +1,19 @@
 package datastruct
 
 import (
+	"encoding/gob"
+	"bytes"
+	"fmt"
 	"sort"
 	"time"
 )
+
+// 初始化时注册所有可能的类型
+func init() {
+	gob.Register(String{})
+	gob.Register(List{})
+	gob.Register(Hash{})
+}
 
 // DataValue 存储的数据值结构
 type DataValue struct {
@@ -17,6 +27,52 @@ func (dv *DataValue) IsExpired() bool {
 		return false
 	}
 	return time.Now().UnixMilli() > dv.ExpireTime
+}
+
+// Serialize 序列化 DataValue
+func (dv *DataValue) Serialize() ([]byte, error) {
+	var buf bytes.Buffer
+	encoder := gob.NewEncoder(&buf)
+	
+	// 先写入 ExpireTime
+	err := encoder.Encode(dv.ExpireTime)
+	if err != nil {
+		return nil, err
+	}
+	
+	// 再写入 Value
+	err = encoder.Encode(dv.Value)
+	if err != nil {
+		return nil, err
+	}
+	
+	return buf.Bytes(), nil
+}
+
+// Deserialize 反序列化 DataValue
+func DeserializeDataValue(data []byte) (*DataValue, error) {
+	buf := bytes.NewBuffer(data)
+	decoder := gob.NewDecoder(buf)
+	
+	dv := &DataValue{}
+	
+	// 先读取 ExpireTime
+	err := decoder.Decode(&dv.ExpireTime)
+	if err != nil {
+		return nil, err
+	}
+	
+	// 再读取 Value - 创建一个空接口来接收
+	// Gob 会自动根据注册的类型信息解码为具体类型
+	var value interface{}
+	err = decoder.Decode(&value)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode value: %w", err)
+	}
+	
+	dv.Value = value
+	
+	return dv, nil
 }
 
 // String 字符串类型
