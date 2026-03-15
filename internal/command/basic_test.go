@@ -12,8 +12,8 @@ import (
 func TestSetAndGet(t *testing.T) {
 	cfg := config.DefaultConfig()
 	dbManager := database.NewDBManager(cfg)
-	db := dbManager.GetDB()
-	
+	db := dbManager.GetDefaultDB()
+
 	// 测试 SET
 	setCmd := &command.SetCommand{}
 	resp := setCmd.Execute(db, []string{"name", "Alice"})
@@ -35,8 +35,8 @@ func TestSetAndGet(t *testing.T) {
 func TestDel(t *testing.T) {
 	cfg := config.DefaultConfig()
 	dbManager := database.NewDBManager(cfg)
-	db := dbManager.GetDB()
-	
+	db := dbManager.GetDefaultDB()
+
 	// 先设置一个值
 	db.Set("testkey", &datastruct.DataValue{
 		Value:      &datastruct.String{Data: "testvalue"},
@@ -57,8 +57,8 @@ func TestDel(t *testing.T) {
 func TestExists(t *testing.T) {
 	cfg := config.DefaultConfig()
 	dbManager := database.NewDBManager(cfg)
-	db := dbManager.GetDB()
-	
+	db := dbManager.GetDefaultDB()
+
 	// 先设置一个值
 	db.Set("existkey", &datastruct.DataValue{
 		Value:      &datastruct.String{Data: "existvalue"},
@@ -79,8 +79,8 @@ func TestExists(t *testing.T) {
 func TestLPushAndLPop(t *testing.T) {
 	cfg := config.DefaultConfig()
 	dbManager := database.NewDBManager(cfg)
-	db := dbManager.GetDB()
-	
+	db := dbManager.GetDefaultDB()
+
 	// 测试 LPUSH
 	lpushCmd := &command.LPushCommand{}
 	resp := lpushCmd.Execute(db, []string{"mylist", "a", "b", "c"})

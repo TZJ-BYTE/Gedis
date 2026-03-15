@@ -12,7 +12,6 @@ import (
 // DBManager 数据库管理器
 type DBManager struct {
 	databases []*Database
-	currentDB int
 	lock      sync.RWMutex
 	config    *config.Config
 	
@@ -81,7 +80,6 @@ func NewDBManager(cfg *config.Config) *DBManager {
 	
 	return &DBManager{
 		databases:          databases,
-		currentDB:          0,
 		config:             cfg,
 		persistenceEnabled: persistenceEnabled,
 		dataDir:            dataDir,
@@ -89,39 +87,17 @@ func NewDBManager(cfg *config.Config) *DBManager {
 	}
 }
 
-// GetDB 获取当前数据库
-func (m *DBManager) GetDB() *Database {
-	m.lock.RLock()
-	defer m.lock.RUnlock()
-	return m.databases[m.currentDB]
-}
-
-// SelectDB 选择数据库
-func (m *DBManager) SelectDB(index int) bool {
-	if index < 0 || index >= len(m.databases) {
-		return false
-	}
-	
-	m.lock.Lock()
-	defer m.lock.Unlock()
-	
-	m.currentDB = index
-	logger.Info("切换到数据库 %d", index)
-	return true
+// GetDefaultDB 获取默认数据库 (DB 0)
+func (m *DBManager) GetDefaultDB() *Database {
+	return m.databases[0]
 }
 
 // GetDBByIndex 根据索引获取数据库
-func (m *DBManager) GetDBByIndex(index int) (*Database, bool) {
+func (m *DBManager) GetDBByIndex(index int) (*Database, error) {
 	if index < 0 || index >= len(m.databases) {
-		return nil, false
+		return nil, fmt.Errorf("DB index out of range")
 	}
-	return m.databases[index], true
-}
-
-// FlushDB 清空当前数据库
-func (m *DBManager) FlushDB() {
-	m.GetDB().Clear()
-	logger.Info("清空数据库 %d", m.currentDB)
+	return m.databases[index], nil
 }
 
 // FlushAll 清空所有数据库
@@ -130,11 +106,6 @@ func (m *DBManager) FlushAll() {
 		db.Clear()
 	}
 	logger.Info("清空所有数据库")
-}
-
-// DBSize 返回当前数据库大小
-func (m *DBManager) DBSize() int {
-	return m.GetDB().Size()
 }
 
 // DBCount 返回数据库数量
@@ -168,7 +139,6 @@ func (m *DBManager) GetStats() map[string]interface{} {
 	stats := make(map[string]interface{})
 	
 	stats["db_count"] = len(m.databases)
-	stats["current_db"] = m.currentDB
 	stats["persistence_enabled"] = m.persistenceEnabled
 	
 	if m.persistenceEnabled {

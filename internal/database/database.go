@@ -2,9 +2,10 @@ package database
 
 import (
 	"fmt"
+	"hash/fnv"
 	"sync"
 	"time"
-	
+
 	"github.com/TZJ-BYTE/RediGo/config"
 	"github.com/TZJ-BYTE/RediGo/internal/datastruct"
 	"github.com/TZJ-BYTE/RediGo/internal/persistence"
@@ -21,22 +22,32 @@ const (
 	LSMPersistent
 )
 
+const (
+	// ShardCount 分段锁数量
+	ShardCount = 256
+)
+
 // DatabaseConfig 数据库配置
 type DatabaseConfig struct {
-	Type       DatabaseType          // 数据库类型
-	DataDir    string                // 数据目录（仅 LSM 模式需要）
-	Options    *persistence.Options  // LSM 选项（仅 LSM 模式需要）
+	Type    DatabaseType         // 数据库类型
+	DataDir string               // 数据目录（仅 LSM 模式需要）
+	Options *persistence.Options // LSM 选项（仅 LSM 模式需要）
+}
+
+// shard 分段结构
+type shard struct {
+	data map[string]*datastruct.DataValue
+	lock sync.RWMutex
 }
 
 // Database 数据库结构
 type Database struct {
-	id         int
-	data       map[string]*datastruct.DataValue  // 内存数据
-	lock       sync.RWMutex
-	
+	id     int
+	shards [ShardCount]*shard
+
 	// LSM 引擎（可选）
-	lsmEngine  *persistence.LSMEnergy
-	config     *DatabaseConfig
+	lsmEngine *persistence.LSMEnergy
+	config    *DatabaseConfig
 }
 
 // DefaultDatabaseConfig 返回默认配置
@@ -49,19 +60,28 @@ func DefaultDatabaseConfig() *DatabaseConfig {
 
 // NewDatabase 创建新数据库（使用默认配置，纯内存）
 func NewDatabase(id int) *Database {
-	return &Database{
+	db := &Database{
 		id:     id,
-		data:   make(map[string]*datastruct.DataValue),
 		config: DefaultDatabaseConfig(),
 	}
+	for i := 0; i < ShardCount; i++ {
+		db.shards[i] = &shard{
+			data: make(map[string]*datastruct.DataValue),
+		}
+	}
+	return db
 }
 
 // NewDatabaseWithConfig 使用配置创建数据库
 func NewDatabaseWithConfig(id int, config *DatabaseConfig) (*Database, error) {
 	db := &Database{
 		id:     id,
-		data:   make(map[string]*datastruct.DataValue),
 		config: config,
+	}
+	for i := 0; i < ShardCount; i++ {
+		db.shards[i] = &shard{
+			data: make(map[string]*datastruct.DataValue),
+		}
 	}
 	
 	// 如果是 LSM 持久化模式，初始化 LSM 引擎
@@ -126,26 +146,38 @@ func getColdStartStrategyFromConfig() string {
 	}
 }
 
+// getShardIndex 获取分段索引
+func getShardIndex(key string) int {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return int(h.Sum32()) % ShardCount
+}
+
+// getShard 获取 key 对应的 shard
+func (db *Database) getShard(key string) *shard {
+	return db.shards[getShardIndex(key)]
+}
+
 // loadAllFromLSM 从 LSM 全量加载所有数据到内存
 func (db *Database) loadAllFromLSM() error {
 	if db.lsmEngine == nil {
 		return fmt.Errorf("LSM engine not initialized")
 	}
-	
+
 	logger.Info("Loading all data from LSM into memory...")
 	fmt.Printf("[DATABASE] Loading all keys from LSM... SSTable count: %d\n", db.lsmEngine.GetSSTableCount())
-	
+
 	// 使用 LSM Engine 提供的公开方法加载所有键值对
 	allData, err := db.lsmEngine.LoadAllKeys()
 	if err != nil {
 		return fmt.Errorf("failed to load keys from LSM: %v", err)
 	}
-	
+
 	logger.Info("LoadAllKeys returned %d keys", len(allData))
-	
+
 	keysLoaded := 0
 	deserializeErrors := 0
-	
+
 	for key, valueBytes := range allData {
 		// 反序列化 DataValue
 		dataValue, err := datastruct.DeserializeDataValue(valueBytes)
@@ -154,17 +186,21 @@ func (db *Database) loadAllFromLSM() error {
 			deserializeErrors++
 			continue
 		}
-		
+
 		// 检查过期
 		if dataValue.IsExpired() {
 			continue
 		}
-		
-		db.data[key] = dataValue
+
+		// 分段锁
+		shard := db.getShard(key)
+		shard.lock.Lock()
+		shard.data[key] = dataValue
+		shard.lock.Unlock()
 		keysLoaded++
 	}
-	
-	logger.Info("Successfully loaded %d keys into memory map. Map size: %d", keysLoaded, len(db.data))
+
+	logger.Info("Successfully loaded %d keys into memory map.", keysLoaded)
 	return nil
 }
 
@@ -175,11 +211,12 @@ func deserializeDataValue(data []byte) (*datastruct.DataValue, error) {
 
 // Get 获取键值
 func (db *Database) Get(key string) (*datastruct.DataValue, bool) {
+	shard := db.getShard(key)
 	// 先尝试从内存读取
-	db.lock.RLock()
-	value, exists := db.data[key]
-	db.lock.RUnlock()
-	
+	shard.lock.RLock()
+	value, exists := shard.data[key]
+	shard.lock.RUnlock()
+
 	if exists {
 		// 检查过期
 		if value.IsExpired() {
@@ -187,7 +224,7 @@ func (db *Database) Get(key string) (*datastruct.DataValue, bool) {
 		}
 		return value, true
 	}
-	
+
 	// 内存中没有，尝试从 LSM 读取（懒加载）
 	if db.lsmEngine != nil {
 		valBytes, found := db.lsmEngine.Get([]byte(key))
@@ -199,7 +236,7 @@ func (db *Database) Get(key string) (*datastruct.DataValue, bool) {
 				// 反序列化失败，视为不存在
 				return nil, false
 			}
-			
+
 			// 检查过期
 			if dataValue.IsExpired() {
 				// 异步删除过期数据
@@ -210,37 +247,35 @@ func (db *Database) Get(key string) (*datastruct.DataValue, bool) {
 				}(key)
 				return nil, false
 			}
-			
+
 			// 加载到内存（热点数据）
-			// 注意：这里需要重新获取写锁，因为之前是读锁且已经释放
-			// 再次检查是否存在（双重检查），防止并发加载
-			db.lock.Lock()
+			shard.lock.Lock()
 			// 双重检查
-			if existingValue, ok := db.data[key]; ok {
-				db.lock.Unlock()
+			if existingValue, ok := shard.data[key]; ok {
+				shard.lock.Unlock()
 				if existingValue.IsExpired() {
 					return nil, false
 				}
 				return existingValue, true
 			}
-			
-			db.data[key] = dataValue
-			db.lock.Unlock()
-			
+
+			shard.data[key] = dataValue
+			shard.lock.Unlock()
+
 			return dataValue, true
 		}
 	}
-	
+
 	return nil, false
 }
 
 // Set 设置键值
 func (db *Database) Set(key string, value *datastruct.DataValue) {
-	db.lock.Lock()
-	defer db.lock.Unlock()
-	
-	db.data[key] = value
-	
+	shard := db.getShard(key)
+	shard.lock.Lock()
+	shard.data[key] = value
+	shard.lock.Unlock()
+
 	// 如果启用了 LSM，同时写入 LSM 引擎
 	if db.lsmEngine != nil {
 		// 将数据序列化后写入 LSM
@@ -258,16 +293,16 @@ func (db *Database) Set(key string, value *datastruct.DataValue) {
 
 // Delete 删除键
 func (db *Database) Delete(key string) bool {
-	db.lock.Lock()
-	defer db.lock.Unlock()
-	
-	_, exists := db.data[key]
-	
+	shard := db.getShard(key)
+	shard.lock.Lock()
+	_, exists := shard.data[key]
+
 	// 从内存删除
 	if exists {
-		delete(db.data, key)
+		delete(shard.data, key)
 	}
-	
+	shard.lock.Unlock()
+
 	// 如果启用了 LSM，始终尝试从 LSM 删除
 	// 无论内存中是否存在，LSM 中可能存在（例如懒加载或数据不一致）
 	if db.lsmEngine != nil {
@@ -276,29 +311,31 @@ func (db *Database) Delete(key string) bool {
 			logger.Error("Failed to delete from LSM: %v", err)
 		}
 	}
-	
+
 	return exists
 }
 
 // Exists 检查键是否存在
 func (db *Database) Exists(key string) bool {
-	db.lock.RLock()
-	defer db.lock.RUnlock()
-	
-	_, exists := db.data[key]
-	return exists && !db.data[key].IsExpired()
+	shard := db.getShard(key)
+	shard.lock.RLock()
+	defer shard.lock.RUnlock()
+
+	_, exists := shard.data[key]
+	return exists && !shard.data[key].IsExpired()
 }
 
 // Expire 设置过期时间
 func (db *Database) Expire(key string, milliseconds int64) bool {
-	db.lock.Lock()
-	defer db.lock.Unlock()
-	
-	value, exists := db.data[key]
+	shard := db.getShard(key)
+	shard.lock.Lock()
+	defer shard.lock.Unlock()
+
+	value, exists := shard.data[key]
 	if !exists {
 		return false
 	}
-	
+
 	// 设置为绝对时间戳（当前时间 + TTL 毫秒）
 	value.ExpireTime = time.Now().UnixMilli() + milliseconds
 	return true
@@ -306,41 +343,46 @@ func (db *Database) Expire(key string, milliseconds int64) bool {
 
 // Keys 返回所有键
 func (db *Database) Keys() []string {
-	db.lock.RLock()
-	defer db.lock.RUnlock()
-	
-	keys := make([]string, 0, len(db.data))
-	for key, value := range db.data {
-		// 这里 value 是 *datastruct.DataValue
-		// 我们需要检查它是否为 nil（虽然不应该）以及是否过期
-		if value != nil && !value.IsExpired() {
-			keys = append(keys, key)
+	keys := make([]string, 0)
+
+	for i := 0; i < ShardCount; i++ {
+		shard := db.shards[i]
+		shard.lock.RLock()
+		for key, value := range shard.data {
+			if value != nil && !value.IsExpired() {
+				keys = append(keys, key)
+			}
 		}
+		shard.lock.RUnlock()
 	}
 	return keys
 }
 
 // Size 返回数据库大小
 func (db *Database) Size() int {
-	db.lock.RLock()
-	defer db.lock.RUnlock()
-	
 	count := 0
-	for _, value := range db.data {
-		if !value.IsExpired() {
-			count++
+	for i := 0; i < ShardCount; i++ {
+		shard := db.shards[i]
+		shard.lock.RLock()
+		for _, value := range shard.data {
+			if !value.IsExpired() {
+				count++
+			}
 		}
+		shard.lock.RUnlock()
 	}
 	return count
 }
 
 // Clear 清空数据库
 func (db *Database) Clear() {
-	db.lock.Lock()
-	defer db.lock.Unlock()
-	
-	db.data = make(map[string]*datastruct.DataValue)
-	
+	for i := 0; i < ShardCount; i++ {
+		shard := db.shards[i]
+		shard.lock.Lock()
+		shard.data = make(map[string]*datastruct.DataValue)
+		shard.lock.Unlock()
+	}
+
 	// 如果启用了 LSM，清空 LSM 引擎（通过删除所有 SSTable）
 	// 注意：这是一个重量级操作，实际实现可能需要优化
 	if db.lsmEngine != nil {
@@ -350,9 +392,14 @@ func (db *Database) Clear() {
 
 // Close 关闭数据库
 func (db *Database) Close() error {
-	db.lock.Lock()
-	defer db.lock.Unlock()
-	
+	// 这里不需要对所有 shards 加锁，因为 Close 意味着系统正在关闭
+	// 但为了安全起见，我们还是可以加锁，或者直接关闭 LSM
+	for i := 0; i < ShardCount; i++ {
+		shard := db.shards[i]
+		shard.lock.Lock()
+		shard.lock.Unlock()
+	}
+
 	if db.lsmEngine != nil {
 		return db.lsmEngine.Close()
 	}
@@ -362,11 +409,16 @@ func (db *Database) Close() error {
 // GetStats 获取数据库统计信息
 func (db *Database) GetStats() map[string]interface{} {
 	stats := make(map[string]interface{})
-	
-	db.lock.RLock()
-	stats["memory_keys"] = len(db.data)
-	db.lock.RUnlock()
-	
+
+	keyCount := 0
+	for i := 0; i < ShardCount; i++ {
+		shard := db.shards[i]
+		shard.lock.RLock()
+		keyCount += len(shard.data)
+		shard.lock.RUnlock()
+	}
+	stats["memory_keys"] = keyCount
+
 	if db.lsmEngine != nil {
 		stats["mode"] = "LSM"
 		// TODO: 添加 LSM 引擎的 GetStats 方法
@@ -375,6 +427,6 @@ func (db *Database) GetStats() map[string]interface{} {
 		stats["mode"] = "Memory"
 		stats["lsm_enabled"] = false
 	}
-	
+
 	return stats
 }

@@ -15,6 +15,41 @@
 3.  **SSTable (书架)**: 仓库里的书架。书被整齐地排序、归档，查找起来很方便。
 4.  **WAL (日记本)**: 为了防止断电，每次收书前先在日记本上记一笔。
 
+```mermaid
+graph TD
+    %% Style Definitions
+    classDef memory fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#333;
+    classDef disk fill:#fff3e0,stroke:#ef6c00,stroke-width:2px,color:#333;
+    classDef component fill:#ffffff,stroke:#333,stroke-width:1px,color:#333;
+
+    subgraph Memory [In-Memory / 内存区]
+        direction TB
+        Mem[MemTable<br/>Active Write]:::component
+        Imm[Immutable MemTable<br/>Read Only]:::component
+    end
+
+    subgraph Disk [Disk Storage / 磁盘存储区]
+        direction TB
+        L0[Level 0<br/>4MB<br/>Keys may overlap]:::component
+        L1[Level 1<br/>10MB<br/>Sorted, No overlap]:::component
+        L2[Level 2<br/>100MB]:::component
+        L3[Level 3<br/>1GB]:::component
+        Ln[... Level 4-5 ...]:::component
+        L6[Level 6<br/>10TB]:::component
+    end
+
+    Mem -->|Full| Imm
+    Imm -->|Flush| L0
+    L0 -->|Compaction| L1
+    L1 -->|Compaction| L2
+    L2 -->|Compaction| L3
+    L3 -->|Compaction| Ln
+    Ln -->|Compaction| L6
+
+    style Memory fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#333
+    style Disk fill:#fff3e0,stroke:#ef6c00,stroke-width:2px,color:#333
+```
+
 ***
 
 ## 🏗️ 核心架构
@@ -56,6 +91,13 @@ classDiagram
     LSMEngine --> ImmutableMemTable : 3. 转为只读 (准备刷盘)
     ImmutableMemTable --> SSTable : 4. 持久化文件 (落盘)
     Compactor ..> SSTable : 5. 多层合并 (空间回收)
+
+    style LSMEngine fill:#1976d2,stroke:#333,stroke-width:2px,color:#fff
+    style MemTable fill:#1976d2,stroke:#333,stroke-width:2px,color:#fff
+    style ImmutableMemTable fill:#1976d2,stroke:#333,stroke-width:2px,color:#fff
+    style WAL fill:#e64a19,stroke:#333,stroke-width:2px,color:#fff
+    style SSTable fill:#455a64,stroke:#333,stroke-width:2px,color:#fff
+    style Compactor fill:#388e3c,stroke:#333,stroke-width:2px,color:#fff
 ```
 
 **组件功能详解：**
@@ -87,13 +129,13 @@ sequenceDiagram
 
     Client->>Engine: 发起写请求 Put("key", "val")
     
-    rect rgb(240, 248, 255)
+    rect rgb(69, 90, 100)
     Note right of Engine: 第一步：持久化保障
     Engine->>WAL: Append Log (顺序追加日志)
     WAL-->>Engine: 写入成功
     end
 
-    rect rgb(255, 250, 240)
+    rect rgb(25, 118, 210)
     Note right of Engine: 第二步：内存操作
     Engine->>MemTable: Insert (插入跳表 O(log N))
     MemTable-->>Engine: 插入成功
@@ -101,7 +143,7 @@ sequenceDiagram
 
     Engine-->>Client: 返回 OK
 
-    rect rgb(245, 245, 245)
+    rect rgb(56, 142, 60)
     Note over Engine,Disk: 异步后台流程 (不阻塞客户端)
     Engine->>Engine: 检查 MemTable 大小
     opt MemTable 已满 (> 4MB)
@@ -181,28 +223,34 @@ graph TD
 
 ```mermaid
 graph TD
-    subgraph Level 0 [Level 0: Key 范围可能重叠]
-        F1[文件 A: 1..100]
-        F2[文件 B: 50..150]
-        F3[文件 C: 80..200]
+    %% Style Definitions
+    classDef file fill:#fff3e0,stroke:#ef6c00,stroke-width:2px,color:#333;
+    classDef process fill:#e1f5fe,stroke:#0277bd,stroke-width:2px,color:#333;
+    classDef newfile fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#333;
+
+    subgraph Level0 [Level 0: Key 范围可能重叠]
+        F1[文件 A: 1..100]:::file
+        F2[文件 B: 50..150]:::file
+        F3[文件 C: 80..200]:::file
     end
     
-    subgraph Level 1 [Level 1: 有序，无重叠]
-        L1F1[文件 X: 10..40]
-        L1F2[文件 Y: 200..300]
+    subgraph Level1 [Level 1: 有序，无重叠]
+        L1F1[文件 X: 10..40]:::file
+        L1F2[文件 Y: 200..300]:::file
     end
     
-    Compactor((Compactor<br/>合并线程))
+    Compactor((Compactor<br/>合并线程)):::process
     
     F1 --> Compactor
     F2 --> Compactor
     F3 --> Compactor
     L1F1 --> Compactor
     
-    Compactor --> NewF1[新文件: 1..150]
-    Compactor --> NewF2[新文件: 151..300]
+    Compactor --> NewF1[新文件: 1..150]:::newfile
+    Compactor --> NewF2[新文件: 151..300]:::newfile
     
-    style Compactor fill:#f96,stroke:#333
+    style Level0 fill:#fff3e0,stroke:#ef6c00,stroke-dasharray: 5 5,color:#333
+    style Level1 fill:#e8f5e9,stroke:#2e7d32,stroke-dasharray: 5 5,color:#333
 ```
 
 ### 2. SSTable 文件格式
@@ -395,20 +443,34 @@ grep -E "(Recover|LoadAllKeys)" logs/server.log
 
 ***
 
-### 潜在优化方向
+### 🚀 未来演进：Hybrid-Tiered Storage Engine
 
-1. **Write Stall (写入流控)**
-   - **问题**: 写入过快导致 Level 0 堆积，读性能下降
-   - **改进**: 达到阈值（如 12 个文件）时主动降速，平衡读写
-2. **Universal Compaction (Tiered)**
-   - **问题**: Leveled 写放大较高
-   - **改进**: 引入 RocksDB 风格策略，适合写多读少场景
-3. **Key-Value 分离 (WiscKey)**
-   - **问题**: 大 Value 搬运成本高
-   - **改进**: 仅 LSM 存 Key，Value 存 Log，大幅降低写放大
-4. **动态 Level 调整**
-   - **问题**: 固定层级不适应动态负载
-   - **改进**: 自适应调整每层大小阈值
+为了进一步提升性能和适应云原生环境，RediGo 计划在未来版本中引入以下创新架构：
+
+#### 1. 智能冷热分层 (AI-driven Hot/Cold Tiering)
+
+- **痛点**: 传统 Compaction 策略对数据热度无感知，导致热数据频繁下沉，影响读取性能。
+- **创新**: 引入**访问频率感知的 Compaction**。
+  - 在 Block Cache 中统计 Key 的访问热度。
+  - **Pinning**: 极热的 SSTable 直接“钉”在 Block Cache 中，永不淘汰。
+  - **Lazy Merge**: 暂缓热数据合并到更底层，减少读取时的层级穿透。
+
+#### 2. 极致的 Key-Value 分离 (WiscKey 风格)
+
+- **痛点**: 大 Value (如 JSON, Blob) 导致严重的写放大，Compaction 搬运成本极高。
+- **创新**: **Value Log (vLog)** 机制。
+  - LSM Tree 只存储 `Key -> <FileID, Offset, Size>` 的元数据指针。
+  - 大 Value 直接追加写入 append-only 的 `vLog` 文件。
+  - **收益**: Compaction 只需重写极小的 Key 和指针，写放大降低 10x 以上。
+
+#### 3. 存算分离架构 (Cloud Native Tiering)
+
+- **痛点**: 本地磁盘容量有限，扩容复杂且昂贵。
+- **创新**: **基于 S3/MinIO 的冷数据卸载**。
+  - **Level 0-1 (热层)**: 驻留本地 NVMe SSD，保证极速读写。
+  - **Level 2+ (冷层)**: 自动异步上传到对象存储 (S3)。
+  - **按需加载**: 本地仅保留冷数据的元数据和 Bloom Filter，读取时按需从 S3 拉取 Block。
+  - **收益**: 实现“无限容量”的 Redis，成本极低，完美适配 Serverless 架构。
 
 ***
 

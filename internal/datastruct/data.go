@@ -58,7 +58,7 @@ func (dv *DataValue) Serialize() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// Deserialize 反序列化 DataValue
+// DeserializeDataValue 反序列化 DataValue
 func DeserializeDataValue(data []byte) (*DataValue, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("empty data")
@@ -77,11 +77,13 @@ func DeserializeDataValue(data []byte) (*DataValue, error) {
 	
 	decoder := gob.NewDecoder(buf)
 	
-	dv := &DataValue{}
+	// 使用对象池
+	dv := NewDataValue()
 	
 	// 先读取 ExpireTime
 	err = decoder.Decode(&dv.ExpireTime)
 	if err != nil {
+		FreeDataValue(dv) // 失败归还
 		return nil, err
 	}
 	
@@ -90,6 +92,7 @@ func DeserializeDataValue(data []byte) (*DataValue, error) {
 	var value interface{}
 	err = decoder.Decode(&value)
 	if err != nil {
+		FreeDataValue(dv) // 失败归还
 		return nil, fmt.Errorf("failed to decode value: %w", err)
 	}
 	

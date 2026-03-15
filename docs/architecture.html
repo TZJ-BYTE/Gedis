@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RediGo 系统架构详解</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', 'Noto Sans SC', sans-serif;
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            min-height: 100vh;
+        }
+        
+        .layer-card {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 16px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+            margin-bottom: 1.5rem;
+        }
+        
+        .component-box {
+            transition: all 0.2s ease;
+            cursor: pointer;
+        }
+        
+        .component-box:hover {
+            transform: scale(1.02);
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+        }
+        
+        .arrow-connector {
+            position: relative;
+        }
+        
+        .arrow-connector::after {
+            content: '↓';
+            position: absolute;
+            left: 50%;
+            bottom: -25px;
+            transform: translateX(-50%);
+            color: #64748b;
+            font-size: 24px;
+            font-weight: bold;
+        }
+        
+        .gradient-text {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        /* Custom scrollbar */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #f1f1f1;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #888;
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #555;
+        }
+    </style>
+</head>
+<body class="p-4 md:p-8">
+    <div class="max-w-7xl mx-auto">
+        <!-- Header -->
+        <div class="text-center mb-8">
+            <h1 class="text-4xl font-bold gradient-text mb-2">RediGo 系统组件架构</h1>
+            <p class="text-gray-600">高性能分布式缓存系统架构图解</p>
+            <p class="text-sm text-gray-500 mt-2">专为高性能与高并发设计</p>
+        </div>
+
+        <!-- Main Architecture Container -->
+        <div class="relative">
+            
+            <!-- Layer 1: Client Access -->
+            <div class="layer-card p-6 border-l-4 border-orange-400 arrow-connector">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-lg font-bold text-orange-700 flex items-center gap-2">
+                        <span class="w-8 h-8 bg-orange-100 rounded-full flex items-center justify-center">📱</span>
+                        客户端接入层 (Client Layer)
+                    </h2>
+                    <span class="text-xs bg-orange-100 text-orange-700 px-3 py-1 rounded-full">入口</span>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div class="component-box bg-gradient-to-br from-orange-50 to-orange-100 border-2 border-orange-300 rounded-xl p-4 text-center">
+                        <div class="text-2xl mb-2">🔴</div>
+                        <div class="font-semibold text-orange-800">Redis 客户端</div>
+                        <div class="text-xs text-orange-600 mt-1">redis-cli / Jedis / go-redis</div>
+                    </div>
+                    <div class="component-box bg-gradient-to-br from-orange-50 to-orange-100 border-2 border-orange-300 rounded-xl p-4 text-center">
+                        <div class="text-2xl mb-2">📦</div>
+                        <div class="font-semibold text-orange-800">SDK 支持</div>
+                        <div class="text-xs text-orange-600 mt-1">多语言 SDK 接入</div>
+                    </div>
+                    <div class="component-box bg-gradient-to-br from-orange-50 to-orange-100 border-2 border-orange-300 rounded-xl p-4 text-center">
+                        <div class="text-2xl mb-2">🌐</div>
+                        <div class="font-semibold text-orange-800">TCP 长连接</div>
+                        <div class="text-xs text-orange-600 mt-1">完全兼容 Redis 协议</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Layer 2: Network Layer -->
+            <div class="layer-card p-6 border-l-4 border-blue-500 arrow-connector" style="margin-top: 2rem;">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-lg font-bold text-blue-700 flex items-center gap-2">
+                        <span class="w-8 h-8 bg-blue-100 rounded-full flex items-center justify-center">🌐</span>
+                        网络协议层 (Network Layer)
+                    </h2>
+                    <span class="text-xs bg-blue-100 text-blue-700 px-3 py-1 rounded-full">高性能核心</span>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div class="component-box bg-gradient-to-br from-blue-50 to-blue-100 border-2 border-blue-300 rounded-xl p-4">
+                        <div class="flex items-center justify-between mb-2">
+                            <span class="text-xl">🚀</span>
+                            <span class="text-xs bg-blue-200 px-2 py-1 rounded">标准版</span>
+                        </div>
+                        <div class="font-semibold text-blue-800">标准 Server (Std)</div>
+                        <div class="text-xs text-blue-600 mt-1">基于 net/http</div>
+                        <div class="text-xs text-gray-500 mt-2">单连接单协程模型</div>
+                    </div>
+                    
+                    <div class="component-box bg-gradient-to-br from-blue-50 to-blue-100 border-2 border-blue-300 rounded-xl p-4 relative overflow-hidden">
+                        <div class="absolute top-2 right-2">
+                            <span class="text-xs bg-green-200 text-green-700 px-2 py-1 rounded">高性能</span>
+                        </div>
+                        <div class="flex items-center justify-between mb-2">
+                            <span class="text-xl">⚡</span>
+                        </div>
+                        <div class="font-semibold text-blue-800">Gnet Server (Reactor)</div>
+                        <div class="text-xs text-blue-600 mt-1">Reactor 事件驱动模型</div>
+                        <div class="text-xs text-gray-500 mt-2">基于 epoll/kqueue</div>
+                    </div>
+                    
+                    <div class="component-box bg-gradient-to-br from-blue-50 to-blue-100 border-2 border-blue-300 rounded-xl p-4">
+                        <div class="flex items-center justify-between mb-2">
+                            <span class="text-xl">📋</span>
+                            <span class="text-xs bg-purple-200 px-2 py-1 rounded">协议解析</span>
+                        </div>
+                        <div class="font-semibold text-blue-800">RESP 解析器</div>
+                        <div class="text-xs text-blue-600 mt-1">协议解码引擎</div>
+                        <div class="text-xs text-gray-500 mt-2">零拷贝 (Zero-Copy) 解析</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Layer 3: Logic Layer -->
+            <div class="layer-card p-6 border-l-4 border-green-500 arrow-connector" style="margin-top: 2rem;">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-lg font-bold text-green-700 flex items-center gap-2">
+                        <span class="w-8 h-8 bg-green-100 rounded-full flex items-center justify-center">⚙️</span>
+                        核心逻辑层 (Logic Layer)
+                    </h2>
+                    <span class="text-xs bg-green-100 text-green-700 px-3 py-1 rounded-full">业务引擎</span>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div class="component-box bg-gradient-to-br from-green-50 to-green-100 border-2 border-green-300 rounded-xl p-4">
+                        <div class="text-2xl mb-2">🎯</div>
+                        <div class="font-semibold text-green-800">命令分发器</div>
+                        <div class="text-xs text-green-600 mt-1">注册表模式 (Registry)</div>
+                        <div class="mt-3 flex gap-2">
+                            <span class="text-xs bg-white px-2 py-1 rounded border">GET</span>
+                            <span class="text-xs bg-white px-2 py-1 rounded border">SET</span>
+                            <span class="text-xs bg-white px-2 py-1 rounded border">DEL</span>
+                        </div>
+                    </div>
+                    
+                    <div class="component-box bg-gradient-to-br from-green-50 to-green-100 border-2 border-green-300 rounded-xl p-4">
+                        <div class="text-2xl mb-2">💾</div>
+                        <div class="font-semibold text-green-800">连接上下文</div>
+                        <div class="text-xs text-green-600 mt-1">状态管理 (Context)</div>
+                        <div class="mt-3 text-xs text-gray-600">
+                            <div>• 当前数据库</div>
+                            <div>• 认证状态</div>
+                            <div>• 管道缓冲区</div>
+                        </div>
+                    </div>
+                    
+                    <div class="component-box bg-gradient-to-br from-green-50 to-green-100 border-2 border-green-300 rounded-xl p-4">
+                        <div class="text-2xl mb-2">🗄️</div>
+                        <div class="font-semibold text-green-800">数据库管理器</div>
+                        <div class="text-xs text-green-600 mt-1">多租户支持 (DB 0-15)</div>
+                        <div class="mt-3 grid grid-cols-4 gap-1">
+                            <div class="text-xs bg-white border rounded text-center py-1">0</div>
+                            <div class="text-xs bg-white border rounded text-center py-1">1</div>
+                            <div class="text-xs bg-white border rounded text-center py-1">...</div>
+                            <div class="text-xs bg-white border rounded text-center py-1">15</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Layer 4: Storage Layer -->
+            <div class="layer-card p-6 border-l-4 border-gray-500" style="margin-top: 2rem;">
+                <div class="flex items-center justify-between mb-4">
+                    <h2 class="text-lg font-bold text-gray-700 flex items-center gap-2">
+                        <span class="w-8 h-8 bg-gray-100 rounded-full flex items-center justify-center">💾</span>
+                        存储引擎层 (Storage Layer)
+                    </h2>
+                    <span class="text-xs bg-gray-100 text-gray-700 px-3 py-1 rounded-full">持久化</span>
+                </div>
+                
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <!-- Sharding -->
+                    <div class="component-box bg-gradient-to-br from-gray-50 to-gray-100 border-2 border-gray-300 rounded-xl p-4">
+                        <div class="flex items-center justify-between mb-2">
+                            <span class="text-xl">🔒</span>
+                            <span class="text-xs bg-red-100 text-red-600 px-2 py-1 rounded">并发控制</span>
+                        </div>
+                        <div class="font-semibold text-gray-800">分片锁 (Sharded Locks)</div>
+                        <div class="text-xs text-gray-600 mt-1">256 槽位细粒度锁</div>
+                        <div class="mt-3 h-2 bg-gray-200 rounded-full overflow-hidden">
+                            <div class="h-full bg-gradient-to-r from-blue-400 to-purple-500 w-3/4"></div>
+                        </div>
+                        <div class="text-xs text-gray-500 mt-1">大幅降低锁竞争</div>
+                    </div>
+                    
+                    <!-- Memory Store -->
+                    <div class="component-box bg-gradient-to-br from-gray-50 to-gray-100 border-2 border-gray-300 rounded-xl p-4">
+                        <div class="flex items-center justify-between mb-2">
+                            <span class="text-xl">⚡</span>
+                            <span class="text-xs bg-yellow-100 text-yellow-700 px-2 py-1 rounded">O(1)</span>
+                        </div>
+                        <div class="font-semibold text-gray-800">内存存储 (Memory)</div>
+                        <div class="text-xs text-gray-600 mt-1">原生 Hash Map</div>
+                        <div class="mt-3 grid grid-cols-3 gap-2 text-center text-xs">
+                            <div class="bg-white border rounded p-1">Key</div>
+                            <div class="bg-white border rounded p-1">→</div>
+                            <div class="bg-white border rounded p-1">Value</div>
+                        </div>
+                    </div>
+                    
+                    <!-- LSM Engine -->
+                    <div class="component-box bg-gradient-to-br from-gray-50 to-gray-100 border-2 border-gray-300 rounded-xl p-4">
+                        <div class="flex items-center justify-between mb-2">
+                            <span class="text-xl">🌲</span>
+                            <span class="text-xs bg-green-100 text-green-700 px-2 py-1 rounded">磁盘</span>
+                        </div>
+                        <div class="font-semibold text-gray-800">LSM 引擎</div>
+                        <div class="text-xs text-gray-600 mt-1">LevelDB 风格</div>
+                        <div class="mt-3 text-xs text-gray-600">
+                            <div class="flex items-center gap-2 mb-1">
+                                <div class="w-2 h-2 bg-green-400 rounded-full"></div>
+                                <span>MemTable (内存表)</span>
+                            </div>
+                            <div class="flex items-center gap-2 mb-1">
+                                <div class="w-2 h-2 bg-blue-400 rounded-full"></div>
+                                <span>SSTable (磁盘文件)</span>
+                            </div>
+                            <div class="flex items-center gap-2">
+                                <div class="w-2 h-2 bg-gray-400 rounded-full"></div>
+                                <span>Compaction (合并)</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Flow Indicators -->
+            <div class="flex justify-center items-center gap-8 my-6 text-sm text-gray-600">
+                <div class="flex items-center gap-2">
+                    <div class="w-12 h-0.5 bg-blue-400"></div>
+                    <span>同步流程</span>
+                </div>
+                <div class="flex items-center gap-2">
+                    <div class="w-12 h-0.5 border-t-2 border-dashed border-gray-400"></div>
+                    <span>异步刷盘</span>
+                </div>
+                <div class="flex items-center gap-2">
+                    <div class="w-3 h-3 bg-red-400 rounded-full"></div>
+                    <span>高性能路径</span>
+                </div>
+            </div>
+
+            <!-- Architecture Features -->
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mt-8">
+                <div class="bg-white rounded-lg p-4 shadow-sm border border-gray-200 text-center">
+                    <div class="text-2xl mb-2">🚀</div>
+                    <div class="font-semibold text-gray-800">极致性能</div>
+                    <div class="text-xs text-gray-600">Gnet + 零拷贝技术</div>
+                </div>
+                <div class="bg-white rounded-lg p-4 shadow-sm border border-gray-200 text-center">
+                    <div class="text-2xl mb-2">🔒</div>
+                    <div class="font-semibold text-gray-800">并发安全</div>
+                    <div class="text-xs text-gray-600">256 分片锁设计</div>
+                </div>
+                <div class="bg-white rounded-lg p-4 shadow-sm border border-gray-200 text-center">
+                    <div class="text-2xl mb-2">💾</div>
+                    <div class="font-semibold text-gray-800">数据持久化</div>
+                    <div class="text-xs text-gray-600">LSM Tree 存储引擎</div>
+                </div>
+                <div class="bg-white rounded-lg p-4 shadow-sm border border-gray-200 text-center">
+                    <div class="text-2xl mb-2">📊</div>
+                    <div class="font-semibold text-gray-800">多租户隔离</div>
+                    <div class="text-xs text-gray-600">16 个独立数据库</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Legend -->
+        <div class="mt-8 p-4 bg-white rounded-lg shadow-sm border border-gray-200">
+            <h3 class="font-semibold text-gray-700 mb-3">架构说明</h3>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm text-gray-600">
+                <div>
+                    <strong>网络层双模式：</strong>支持标准库（兼容性好）和Gnet（高性能）两种网络模型，根据场景灵活选择
+                </div>
+                <div>
+                    <strong>存储引擎：</strong>内存Hash表提供O(1)访问，LSM树实现高效磁盘持久化，支持异步刷盘
+                </div>
+            </div>
+        </div>
+        
+        <!-- Footer -->
+        <div class="mt-8 text-center text-gray-500 text-xs">
+            <p>© 2026 RediGo Project. Generated by Mermaid & Tailwind CSS.</p>
+        </div>
+    </div>
+</body>
+</html>

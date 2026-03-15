@@ -145,6 +145,103 @@ func (p *Parser) readBulkString() (string, error) {
 	return string(buf), nil
 }
 
+// ParseOneRequest 从字节切片中解析一个请求
+// 返回：request, consumed bytes, error
+// 如果数据不足以构成一个完整请求，返回 nil, 0, nil
+func ParseOneRequest(data []byte) (*Request, int, error) {
+	if len(data) == 0 {
+		return nil, 0, nil
+	}
+
+	// 1. 检查类型
+	if data[0] != Array {
+		// 这里可能是内联命令（inline command），暂时只支持 RESP 数组
+		return nil, 0, fmt.Errorf("invalid protocol: expected array")
+	}
+
+	// 2. 找到第一行结束符
+	idx := bytes.IndexByte(data, '\n')
+	if idx == -1 {
+		return nil, 0, nil // 数据不足
+	}
+
+	// 解析数组长度
+	line := data[1:idx]
+	if len(line) > 0 && line[len(line)-1] == '\r' {
+		line = line[:len(line)-1]
+	}
+
+	count, err := strconv.Atoi(string(line))
+	if err != nil {
+		return nil, 0, fmt.Errorf("invalid array length")
+	}
+
+	if count == 0 {
+		return nil, 0, fmt.Errorf("empty array")
+	}
+
+	// 3. 循环解析每个参数
+	offset := idx + 1
+	args := make([]string, 0, count)
+
+	for i := 0; i < count; i++ {
+		// 检查是否有足够的字节读取类型
+		if offset >= len(data) {
+			return nil, 0, nil
+		}
+
+		if data[offset] != BulkString {
+			return nil, 0, fmt.Errorf("expected bulk string")
+		}
+
+		// 找到下一行（长度）
+		nextIdx := bytes.IndexByte(data[offset:], '\n')
+		if nextIdx == -1 {
+			return nil, 0, nil
+		}
+		nextIdx += offset // 转换为绝对索引
+
+		line := data[offset+1 : nextIdx]
+		if len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
+
+		length, err := strconv.Atoi(string(line))
+		if err != nil {
+			return nil, 0, fmt.Errorf("invalid bulk string length")
+		}
+
+		offset = nextIdx + 1
+
+		if length == -1 {
+			args = append(args, "")
+			continue
+		}
+
+		// 检查数据是否足够
+		// 需要 length + 2 (for \r\n)
+		if offset+length+2 > len(data) {
+			return nil, 0, nil
+		}
+
+		arg := string(data[offset : offset+length])
+		args = append(args, arg)
+
+		offset += length + 2
+	}
+
+	if len(args) == 0 {
+		return nil, 0, fmt.Errorf("empty request")
+	}
+
+	req := &Request{
+		Cmd:  strings.ToUpper(args[0]),
+		Args: args[1:],
+	}
+
+	return req, offset, nil
+}
+
 // EncodeResponse 编码响应
 func EncodeResponse(resp *Response) []byte {
 	var buf bytes.Buffer

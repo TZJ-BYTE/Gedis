@@ -16,6 +16,7 @@ const (
 type Config struct {
 	Host string `yaml:"host" json:"host"`
 	Port int    `yaml:"port" json:"port"`
+	NetworkType string `yaml:"network_type" json:"network_type"` // "std", "gnet"
 	
 	// 数据库配置
 	DBCount int `yaml:"db_count" json:"db_count"`
@@ -49,6 +50,7 @@ func DefaultConfig() *Config {
 	return &Config{
 		Host:      "0.0.0.0",
 		Port:      16379,  // 修改为 16379，避免与 Redis 的 6379 冲突
+		NetworkType: "std",
 		DBCount:   16,
 		MaxMemory: 256 * 1024 * 1024, // 256MB
 		

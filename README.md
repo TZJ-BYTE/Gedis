@@ -11,7 +11,10 @@ RediGo 是一个使用 Go 语言实现的高性能、Redis 协议兼容的键值
 ### ✨ 核心特性
 
 - ✅ **Redis 协议兼容** - 支持 33+ 个常用 Redis 命令
+- ✅ **高性能网络层** - 支持标准库 net 和 **gnet (Reactor 模式)** 双引擎切换
 - ✅ **双模式运行** - 内存模式 / LSM Tree 持久化模式
+- ✅ **极致并发** - **分段锁 (Sharded Locks)** 设计，显著减少锁竞争
+- ✅ **零 GC 压力** - 大量使用 **sync.Pool 对象池**，优化内存分配
 - ✅ **高性能存储** - LevelDB/RocksDB 风格的 LSM Tree 引擎
 - ✅ **并发安全** - 完整的读写锁机制
 - ✅ **数据过期** - 支持 TTL/PTTL 精确过期控制
@@ -134,6 +137,7 @@ RediGo/
 server:
   host: "127.0.0.1"
   port: 16379
+  network_type: "std"        # 网络类型：std (标准库) | gnet (高性能 Reactor)
   
 database:
   count: 16  # 数据库数量
@@ -228,35 +232,7 @@ persistence:
 
 ### 整体架构
 
-```mermaid
-graph TD
-    Client[Redis Client] -->|RESP Protocol| TCPServer[TCP Server<br/>Connection Pool]
-    TCPServer --> Dispatcher[Command Dispatcher<br/>PING, SET, GET, INCR...]    
-    Dispatcher --> DBManager[Database Manager<br/>16 Databases, Isolation]      
-
-    DBManager -->|Select Mode| Storage{Storage Mode}
-
-    Storage -->|In-Memory| MemMode[Memory Mode<br/>Go Map + RWMutex]
-    Storage -->|Persistent| LSMMode[LSM Mode<br/>LSMEnergy Engine]
-
-    subgraph LSMEngine [LSM Engine Internals]
-        LSMMode --> MemTable[MemTable<br/>Skip List]
-        MemTable -->|Flush| ImmutaMem[Immutable MemTable]
-        ImmutaMem -->|Write| SSTable[SSTable Files<br/>Level 0-6]
-
-        SSTable -.-> Components[Components]
-        Components --- Bloom[Bloom Filter]
-        Components --- Cache[Block Cache]
-        Components --- WAL[WAL Log]
-        Components --- Compact[Compaction]
-    end
-
-    style Client fill:#f9f,stroke:#333,stroke-width:2px
-    style TCPServer fill:#bbf,stroke:#333,stroke-width:2px
-    style Dispatcher fill:#bfb,stroke:#333,stroke-width:2px
-    style DBManager fill:#fbf,stroke:#333,stroke-width:2px
-    style LSMMode fill:#ff9,stroke:#333,stroke-width:2px
-```
+[🖼️ 在线查看详细架构图 / View Architecture Diagram Online](https://TZJ-BYTE.github.io/RediGo/docs/architecture.html)
 
 ### LSM Tree 架构
 
@@ -400,22 +376,22 @@ netstat -an | grep 16379
 
 - ✅ 基础 Redis 命令支持
 - ✅ LSM Tree 持久化引擎
+- ✅ gnet 高性能网络层
+- ✅ 分段锁并发优化
 - ✅ 多数据库支持
 - ✅ 过期键管理
 
 ### v1.1 (计划中)
 
-- [ ] Write Stall (写入流控)
-- [ ] Universal Compaction (Tiered)
+- [ ] 智能冷热分层 (Hot/Cold Tiering)
 - [ ] Key-Value 分离 (WiscKey)
-- [ ] 动态 Level 调整
+- [ ] 存算分离 (S3/MinIO Offloading)
 
 ### v2.0 (未来)
 
+- [ ] Serverless 架构支持
 - [ ] 分布式事务
 - [ ] 监控 Dashboard
-- [ ] 存算分离架构
-
 
 ***
 
