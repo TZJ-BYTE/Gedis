@@ -1,8 +1,5 @@
 # RediGo - 高性能 Redis 兼容服务器
 
-[!\[Build Status\](https://img.shields.io/badge/build-passing-brightgreen null)]()
-[!\[Redis Protocol\](https://img.shields.io/badge/protocol-redis%207.0-blue null)]()
-[!\[LSM Tree\](https://img.shields.io/badge/storage-lsm%20tree-green null)]()
 
 ## 📖 项目简介
 
@@ -383,10 +380,10 @@ netstat -an | grep 16379
 - ✅ 多数据库支持
 - ✅ 过期键管理
 
-### v1.1 (计划中)
+### v1.1 (进行中)
 
 - [ ] 智能冷热分层 (Hot/Cold Tiering)
-- [ ] Key-Value 分离 (WiscKey)
+- ✅ Key-Value 分离 (WiscKey / vLog)
 - [ ] 存算分离 (S3/MinIO Offloading)
 
 ### v2.0 (未来)

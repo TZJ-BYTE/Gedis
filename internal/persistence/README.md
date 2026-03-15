@@ -381,11 +381,9 @@ options := &persistence.Options{
 **检查步骤**:
 
 1. 检查数据目录 `ls -la data/db_0/sstable/`
-2. 查看日志 `tail -f logs/server.log | grep -E "(LSM|SSTable|Recover)"`
-3. 检查冷启动策略配置 `grep cold_start_strategy config.yml`
+2. 查看日志 `tail -f logs/redigo.log | grep -E "(LSM|SSTable|Recover)"`
    **解决方案**:
 
-- 确保 `cold_start_strategy` 不是 `no_load`
 - 检查 SSTable 文件是否存在且非空
 - 验证 MANIFEST 文件完整性
 
@@ -429,16 +427,16 @@ options := &persistence.Options{
 
 ```bash
 # MemTable 刷写
-grep "\[FLUSH\]" logs/server.log
+grep "\[FLUSH\]" logs/redigo.log
 
 # SSTable 创建
-grep "\[SSTABLE\]" logs/server.log
+grep "\[SSTABLE\]" logs/redigo.log
 
 # Compaction 活动
-grep "\[COMPACTION\]" logs/server.log
+grep "\[COMPACTION\]" logs/redigo.log
 
 # 恢复过程
-grep -E "(Recover|LoadAllKeys)" logs/server.log
+grep -E "(Recover|LoadAllKeys)" logs/redigo.log
 ```
 
 ***
@@ -455,13 +453,14 @@ grep -E "(Recover|LoadAllKeys)" logs/server.log
   - **Pinning**: 极热的 SSTable 直接“钉”在 Block Cache 中，永不淘汰。
   - **Lazy Merge**: 暂缓热数据合并到更底层，减少读取时的层级穿透。
 
-#### 2. 极致的 Key-Value 分离 (WiscKey 风格)
+#### 2. Key-Value 分离 (WiscKey 风格)（已实现）
 
-- **痛点**: 大 Value (如 JSON, Blob) 导致严重的写放大，Compaction 搬运成本极高。
-- **创新**: **Value Log (vLog)** 机制。
+- **目标**: 大 Value (如 JSON, Blob) 降低写放大，减少 Compaction 搬运成本。
+- **当前实现**: **Value Log (vLog)** 机制。
   - LSM Tree 只存储 `Key -> <FileID, Offset, Size>` 的元数据指针。
   - 大 Value 直接追加写入 append-only 的 `vLog` 文件。
-  - **收益**: Compaction 只需重写极小的 Key 和指针，写放大降低 10x 以上。
+  - 通过 `Options.ValueThreshold` 控制是否写入 vLog（默认 64 字节）。
+  - 已包含 vLog GC（基于 key 校验与重写）。
 
 #### 3. 存算分离架构 (Cloud Native Tiering)
 
