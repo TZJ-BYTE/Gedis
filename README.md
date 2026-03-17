@@ -136,7 +136,7 @@ RediGo/
 │
 ├── pkg/                      # 公共工具包
 │   ├── logger/              # 日志包
-│   └── utils/               # 工具函数
+│
 │
 ├── scripts/                  # 辅助脚本
 │   ├── build.ps1            # Windows 构建脚本
@@ -165,9 +165,13 @@ RediGo/
 
 ## 🔧 配置说明
 
-目前服务端配置来自默认配置函数（未提供 `config.yml` 加载/命令行参数覆盖）。如需修改端口、网络引擎、持久化目录、日志路径等，请直接编辑：
+服务端默认从项目根目录的 `config.yaml` 加载配置；也可以在启动时通过 `-config` 指定路径。
 
-- `config.DefaultConfig()`：见 `config/config.go`
+```bash
+go run ./cmd/server -config ./config.yaml
+```
+
+如配置文件不存在或解析失败，会回退到内置默认值；环境变量 `REDIGO_*` 会覆盖配置文件中的同名字段。
 
 ***
 

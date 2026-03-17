@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
@@ -14,12 +15,24 @@ import (
 
 func main() {
 	// 加载配置
-	cfg := config.DefaultConfig()
+	configPath := flag.String("config", "config.yaml", "")
+	flag.Parse()
+
+	cfg, err := config.LoadFromFile(*configPath)
+	if err != nil {
+		cfg = config.DefaultConfig()
+	}
 
 	// 初始化日志
 	if err := logger.Init(cfg.LogPath, cfg.LogLevel); err != nil {
 		fmt.Printf("初始化日志失败：%v\n", err)
 		os.Exit(1)
+	}
+
+	if err != nil {
+		logger.Warn("配置文件加载失败，已回退到默认配置：%v", err)
+	} else {
+		logger.Info("已加载配置文件：%s", *configPath)
 	}
 
 	logger.Info("正在启动 RediGo 服务器...")

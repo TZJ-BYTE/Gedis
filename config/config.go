@@ -68,50 +68,7 @@ type Config struct {
 
 // DefaultConfig 返回默认配置
 func DefaultConfig() *Config {
-	cfg := &Config{
-		Host:            "0.0.0.0",
-		Port:            16379, // 修改为 16379，避免与 Redis 的 6379 冲突
-		NetworkType:     "std",
-		DBCount:         16,
-		MaxMemory:       256 * 1024 * 1024, // 256MB
-		MaxMemoryPolicy: "noeviction",      // 默认不淘汰，内存满时报错
-
-		// 持久化配置（默认启用 LSM）
-		PersistenceEnabled: true,
-		PersistenceType:    "lsm", // 默认使用 LSM
-		DataDir:            "./data",
-		ColdStartStrategy:  "load_all", // 修改为全量加载，测试数据恢复
-
-		// AOF 配置（保留向后兼容）
-		AOFEnabled: false, // 默认关闭 AOF，使用 LSM 替代
-		AOFPath:    "./data/appendonly.aof",
-		RDBPath:    "./data/dump.rdb",
-
-		// LSM 配置
-		BlockSize:       4096,     // 4KB
-		MemTableSize:    4 << 20,  // 4MB
-		WriteBufferSize: 64 << 20, // 64MB
-		MaxOpenFiles:    1000,
-		BloomFilterBits: 10,
-
-		// 日志配置
-		LogLevel: "info",
-		LogPath:  "./logs/redigo.log",
-
-		// 存算分离配置（默认关闭）
-		OffloadEnabled:    false,
-		OffloadBackend:    "fs",
-		OffloadEndpoint:   "127.0.0.1:9000",
-		OffloadAccessKey:  "minioadmin",
-		OffloadSecretKey:  "minioadmin",
-		OffloadBucket:     "redigo-data",
-		OffloadUseSSL:     false,
-		OffloadRegion:     "us-east-1",
-		OffloadBasePrefix: "",
-		OffloadMinLevel:   2,
-		OffloadKeepLocal:  true,
-		OffloadFSRoot:     "./offload",
-	}
+	cfg := defaultConfigNoEnv()
 	cfg.applyEnvOverrides()
 	return cfg
 }
