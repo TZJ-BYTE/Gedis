@@ -62,3 +62,4 @@ coverage.html
 
 # Bench artifacts
 bench-results/
+docs/performance_benchmark_report.md

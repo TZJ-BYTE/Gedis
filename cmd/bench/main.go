@@ -31,10 +31,17 @@ type cfg struct {
 	mode      string
 	ratioGet  float64
 	timeout   time.Duration
+	keyDist   string
+	zipfS     float64
+	zipfV     float64
+	multi     int
+	prefill   bool
+	prefillN  int
 }
 
 type workerResult struct {
 	ops   uint64
+	keys  uint64
 	bytes uint64
 	batch []time.Duration
 	err   error
@@ -52,6 +59,12 @@ func main() {
 	flag.StringVar(&c.mode, "mode", "mixed", "")
 	flag.Float64Var(&c.ratioGet, "ratio_get", 0.8, "")
 	flag.DurationVar(&c.timeout, "timeout", 2*time.Second, "")
+	flag.StringVar(&c.keyDist, "key_dist", "uniform", "")
+	flag.Float64Var(&c.zipfS, "zipf_s", 1.2, "")
+	flag.Float64Var(&c.zipfV, "zipf_v", 1.0, "")
+	flag.IntVar(&c.multi, "multi", 16, "")
+	flag.BoolVar(&c.prefill, "prefill", true, "")
+	flag.IntVar(&c.prefillN, "prefill_n", 20000, "")
 	flag.Parse()
 
 	if c.clients <= 0 {
@@ -67,9 +80,9 @@ func main() {
 		c.valueSize = 0
 	}
 	switch c.mode {
-	case "set", "get", "mixed":
+	case "set", "get", "mixed", "incr", "mget", "mset":
 	default:
-		fmt.Fprintln(os.Stderr, "mode must be set|get|mixed")
+		fmt.Fprintln(os.Stderr, "mode must be set|get|mixed|incr|mget|mset")
 		os.Exit(2)
 	}
 	if c.ratioGet < 0 {
@@ -78,27 +91,43 @@ func main() {
 	if c.ratioGet > 1 {
 		c.ratioGet = 1
 	}
+	if c.multi <= 0 {
+		c.multi = 1
+	}
+	switch c.keyDist {
+	case "uniform", "zipf":
+	default:
+		fmt.Fprintln(os.Stderr, "key_dist must be uniform|zipf")
+		os.Exit(2)
+	}
+	if c.zipfS <= 1 {
+		c.zipfS = 1.2
+	}
+	if c.zipfV <= 0 {
+		c.zipfV = 1.0
+	}
+	if c.prefillN < 0 {
+		c.prefillN = 0
+	}
 
 	addr := net.JoinHostPort(c.host, strconv.Itoa(c.port))
 	value := makeValue(c.valueSize)
 
-	prefillKeys := min(c.keyspace, 20000)
-	if c.mode != "get" && prefillKeys > 0 {
-		if err := prefill(addr, c.timeout, prefillKeys, value); err != nil {
-			fmt.Fprintln(os.Stderr, "prefill:", err)
-			os.Exit(1)
-		}
-	}
-	if c.mode == "get" && prefillKeys > 0 {
-		if err := prefill(addr, c.timeout, prefillKeys, value); err != nil {
-			fmt.Fprintln(os.Stderr, "prefill:", err)
-			os.Exit(1)
+	prefillKeys := min(c.keyspace, c.prefillN)
+	if c.prefill && prefillKeys > 0 {
+		switch c.mode {
+		case "get", "mixed", "mget":
+			if err := prefill(addr, c.timeout, prefillKeys, value); err != nil {
+				fmt.Fprintln(os.Stderr, "prefill:", err)
+				os.Exit(1)
+			}
 		}
 	}
 
 	deadline := time.Now().Add(c.duration)
 
 	var totalOps uint64
+	var totalKeys uint64
 	var totalBytes uint64
 	results := make([]workerResult, c.clients)
 	var wg sync.WaitGroup
@@ -112,6 +141,7 @@ func main() {
 			r := runWorker(addr, c, value, deadline, int64(i))
 			results[i] = r
 			atomic.AddUint64(&totalOps, r.ops)
+			atomic.AddUint64(&totalKeys, r.keys)
 			atomic.AddUint64(&totalBytes, r.bytes)
 		}()
 	}
@@ -128,15 +158,24 @@ func main() {
 	}
 
 	opsPerSec := float64(totalOps) / elapsed.Seconds()
+	keysPerSec := float64(totalKeys) / elapsed.Seconds()
 	mbPerSec := float64(totalBytes) / (1024 * 1024) / elapsed.Seconds()
 
 	latP50, latP95, latP99 := batchLatencyStats(allBatches, c.pipeline)
+	batP50, batP95, batP99 := batchStats(allBatches)
 
-	fmt.Printf("target=%s mode=%s clients=%d pipeline=%d duration=%s keyspace=%d value_size=%d\n",
-		addr, c.mode, c.clients, c.pipeline, c.duration, c.keyspace, c.valueSize)
+	fmt.Printf("target=%s mode=%s clients=%d pipeline=%d duration=%s keyspace=%d value_size=%d key_dist=%s ratio_get=%.2f multi=%d\n",
+		addr, c.mode, c.clients, c.pipeline, c.duration, c.keyspace, c.valueSize, c.keyDist, c.ratioGet, c.multi)
 	fmt.Printf("ops_total=%d ops_per_sec=%.0f mb_per_sec=%.2f\n", totalOps, opsPerSec, mbPerSec)
+	if c.mode == "mget" || c.mode == "mset" {
+		fmt.Printf("keys_total=%d keys_per_sec=%.0f keys_per_op=%d\n", totalKeys, keysPerSec, c.multi)
+	} else {
+		fmt.Printf("keys_total=%d keys_per_sec=%.0f\n", totalKeys, keysPerSec)
+	}
 	fmt.Printf("latency_per_op_ms p50=%.3f p95=%.3f p99=%.3f (batch-derived)\n",
 		latP50.Seconds()*1000, latP95.Seconds()*1000, latP99.Seconds()*1000)
+	fmt.Printf("latency_batch_ms p50=%.3f p95=%.3f p99=%.3f\n",
+		batP50.Seconds()*1000, batP95.Seconds()*1000, batP99.Seconds()*1000)
 	fmt.Printf("runtime_go_version=%s cpu=%d\n", runtime.Version(), runtime.NumCPU())
 }
 
@@ -176,16 +215,26 @@ func runWorker(addr string, c cfg, value []byte, deadline time.Time, seed int64)
 	br := bufio.NewReaderSize(conn, 1<<20)
 	bw := bufio.NewWriterSize(conn, 1<<20)
 	r := mrand.New(mrand.NewSource(seed ^ time.Now().UnixNano()))
+	var zipf *mrand.Zipf
+	if c.keyDist == "zipf" {
+		zipf = mrand.NewZipf(r, c.zipfS, c.zipfV, uint64(c.keyspace-1))
+	}
 
 	batchDur := make([]time.Duration, 0, int(c.duration.Seconds())*10)
 	var ops uint64
+	var keys uint64
 	var bytes uint64
 
 	for time.Now().Before(deadline) {
 		start := time.Now()
 		n := c.pipeline
 		for i := 0; i < n; i++ {
-			k := r.Intn(c.keyspace)
+			var k int
+			if zipf != nil {
+				k = int(zipf.Uint64())
+			} else {
+				k = r.Intn(c.keyspace)
+			}
 			key := fmt.Sprintf("bench:%d", k)
 
 			switch c.mode {
@@ -195,33 +244,76 @@ func runWorker(addr string, c cfg, value []byte, deadline time.Time, seed int64)
 				writeBulkString(bw, key)
 				writeBulkBytes(bw, value)
 				bytes += uint64(len(key) + len(value) + 32)
+				keys++
 			case "get":
 				writeArrayHeader(bw, 2)
 				writeBulkString(bw, "GET")
 				writeBulkString(bw, key)
 				bytes += uint64(len(key) + 16)
+				keys++
+			case "incr":
+				writeArrayHeader(bw, 2)
+				writeBulkString(bw, "INCR")
+				writeBulkString(bw, key)
+				bytes += uint64(len(key) + 16)
+				keys++
+			case "mget":
+				writeArrayHeader(bw, 1+c.multi)
+				writeBulkString(bw, "MGET")
+				bytes += uint64(32)
+				for j := 0; j < c.multi; j++ {
+					var kk int
+					if zipf != nil {
+						kk = int(zipf.Uint64())
+					} else {
+						kk = r.Intn(c.keyspace)
+					}
+					kkey := fmt.Sprintf("bench:%d", kk)
+					writeBulkString(bw, kkey)
+					bytes += uint64(len(kkey) + 16)
+					keys++
+				}
+			case "mset":
+				writeArrayHeader(bw, 1+2*c.multi)
+				writeBulkString(bw, "MSET")
+				bytes += uint64(32)
+				for j := 0; j < c.multi; j++ {
+					var kk int
+					if zipf != nil {
+						kk = int(zipf.Uint64())
+					} else {
+						kk = r.Intn(c.keyspace)
+					}
+					kkey := fmt.Sprintf("bench:%d", kk)
+					writeBulkString(bw, kkey)
+					writeBulkBytes(bw, value)
+					bytes += uint64(len(kkey) + len(value) + 32)
+					keys++
+				}
 			default:
 				if r.Float64() < c.ratioGet {
 					writeArrayHeader(bw, 2)
 					writeBulkString(bw, "GET")
 					writeBulkString(bw, key)
 					bytes += uint64(len(key) + 16)
+					keys++
 				} else {
 					writeArrayHeader(bw, 3)
 					writeBulkString(bw, "SET")
 					writeBulkString(bw, key)
 					writeBulkBytes(bw, value)
 					bytes += uint64(len(key) + len(value) + 32)
+					keys++
 				}
 			}
 		}
 
 		if err := bw.Flush(); err != nil {
-			return workerResult{ops: ops, bytes: bytes, batch: batchDur, err: err}
+			return workerResult{ops: ops, keys: keys, bytes: bytes, batch: batchDur, err: err}
 		}
 		for i := 0; i < n; i++ {
 			if err := readRESP(br); err != nil {
-				return workerResult{ops: ops, bytes: bytes, batch: batchDur, err: err}
+				return workerResult{ops: ops, keys: keys, bytes: bytes, batch: batchDur, err: err}
 			}
 		}
 		d := time.Since(start)
@@ -229,7 +321,7 @@ func runWorker(addr string, c cfg, value []byte, deadline time.Time, seed int64)
 		ops += uint64(n)
 	}
 
-	return workerResult{ops: ops, bytes: bytes, batch: batchDur}
+	return workerResult{ops: ops, keys: keys, bytes: bytes, batch: batchDur}
 }
 
 func batchLatencyStats(batch []time.Duration, pipeline int) (time.Duration, time.Duration, time.Duration) {
@@ -246,6 +338,18 @@ func batchLatencyStats(batch []time.Duration, pipeline int) (time.Duration, time
 	p50 := perOp[int(math.Round(0.50*float64(len(perOp)-1)))]
 	p95 := perOp[int(math.Round(0.95*float64(len(perOp)-1)))]
 	p99 := perOp[int(math.Round(0.99*float64(len(perOp)-1)))]
+	return p50, p95, p99
+}
+
+func batchStats(batch []time.Duration) (time.Duration, time.Duration, time.Duration) {
+	if len(batch) == 0 {
+		return 0, 0, 0
+	}
+	cp := append([]time.Duration(nil), batch...)
+	sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
+	p50 := cp[int(math.Round(0.50*float64(len(cp)-1)))]
+	p95 := cp[int(math.Round(0.95*float64(len(cp)-1)))]
+	p99 := cp[int(math.Round(0.99*float64(len(cp)-1)))]
 	return p50, p95, p99
 }
 

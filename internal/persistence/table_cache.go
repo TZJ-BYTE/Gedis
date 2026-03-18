@@ -159,3 +159,7 @@ func (c *TableCache) Len() int {
 	defer c.mu.RUnlock()
 	return c.lruList.Len()
 }
+
+func (c *TableCache) Capacity() int {
+	return c.capacity
+}

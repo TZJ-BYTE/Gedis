@@ -16,7 +16,21 @@ New-Item -ItemType Directory -Force (Split-Path -Parent $CsvPath) | Out-Null
 if (Test-Path $CsvPath) { Remove-Item $CsvPath -Force }
 "ts,cpu_pct,ws_mb,pm_mb,io_read_mb,io_write_mb,threads,handles" | Out-File -FilePath $CsvPath -Encoding ascii
 
-$bench = Start-Process -FilePath $BenchExe -ArgumentList $BenchArgs -NoNewWindow -PassThru -RedirectStandardOutput $OutPath -RedirectStandardError $ErrPath
+$normArgs = @()
+for ($i = 0; $i -lt $BenchArgs.Count; $i++) {
+  $a = [string]$BenchArgs[$i]
+  if ($a.StartsWith("-") -and (-not $a.Contains("=")) -and ($i + 1 -lt $BenchArgs.Count)) {
+    $b = [string]$BenchArgs[$i + 1]
+    if (-not $b.StartsWith("-")) {
+      $normArgs += ($a + "=" + $b)
+      $i++
+      continue
+    }
+  }
+  $normArgs += $a
+}
+
+$bench = Start-Process -FilePath $BenchExe -ArgumentList ($normArgs -join ' ') -NoNewWindow -PassThru -RedirectStandardOutput $OutPath -RedirectStandardError $ErrPath
 
 $prevCpu = $null
 $prevT = $null

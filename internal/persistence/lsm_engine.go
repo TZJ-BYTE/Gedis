@@ -1069,6 +1069,73 @@ func (e *LSMEnergy) Close() error {
 	return nil
 }
 
+func (e *LSMEnergy) GetStats() map[string]interface{} {
+	if e == nil {
+		return map[string]interface{}{"enabled": false}
+	}
+
+	stats := make(map[string]interface{})
+	stats["enabled"] = true
+	stats["closed"] = e.closed.Load()
+	stats["flushing"] = e.flushing.Load()
+	stats["memtable_bytes"] = e.mutableMem.Size()
+	stats["memtable_entries"] = e.mutableMem.EntryCount()
+	if e.immutableMem != nil {
+		stats["immutable_memtable_bytes"] = e.immutableMem.Size()
+		stats["immutable_memtable_entries"] = e.immutableMem.EntryCount()
+	} else {
+		stats["immutable_memtable_bytes"] = int32(0)
+		stats["immutable_memtable_entries"] = int64(0)
+	}
+
+	stats["writes_per_sec"] = e.writeOpsPerSec.Load()
+	stats["cache_hit_permille"] = e.cacheHitPermille.Load()
+
+	if e.options != nil {
+		stats["value_threshold"] = e.options.ValueThreshold
+		stats["block_size"] = e.options.BlockSize
+		stats["memtable_size_limit"] = e.options.MemTableSize
+		stats["max_open_files"] = e.options.MaxOpenFiles
+		stats["use_bloom_filter"] = e.options.UseBloomFilter
+		stats["use_cache"] = e.options.UseCache
+		stats["cache_size"] = e.options.CacheSize
+		stats["sync_wal"] = e.options.SyncWAL
+		stats["write_ahead_log"] = e.options.WriteAheadLog
+	}
+
+	if e.versionSet != nil {
+		stats["version_set"] = e.versionSet.GetStats()
+	}
+
+	tableStats := map[string]interface{}{}
+	if e.tableCache != nil {
+		tableStats["len"] = e.tableCache.Len()
+		tableStats["capacity"] = e.tableCache.Capacity()
+	} else {
+		tableStats["len"] = 0
+		tableStats["capacity"] = 0
+	}
+	stats["table_cache"] = tableStats
+
+	blockStats := map[string]interface{}{}
+	if e.blockCache != nil {
+		hits, misses, evictions, hitRate := e.blockCache.Stats()
+		blockStats["enabled"] = true
+		blockStats["hits"] = hits
+		blockStats["misses"] = misses
+		blockStats["evictions"] = evictions
+		blockStats["hit_rate"] = hitRate
+		blockStats["size_bytes"] = e.blockCache.Size()
+		blockStats["max_size_bytes"] = e.blockCache.MaxSize()
+		blockStats["items"] = e.blockCache.Len()
+	} else {
+		blockStats["enabled"] = false
+	}
+	stats["block_cache"] = blockStats
+
+	return stats
+}
+
 // GetSeqNum 获取当前序列号
 func (e *LSMEnergy) GetSeqNum() uint64 {
 	return atomic.LoadUint64(&e.seqNum)

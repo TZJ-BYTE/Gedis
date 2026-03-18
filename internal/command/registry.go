@@ -58,6 +58,7 @@ func InitDefaultCommands() {
 
 	// 连接测试命令
 	DefaultRegistry.Register("PING", &PingCommand{})
+	DefaultRegistry.Register("INFO", &InfoCommand{})
 
 	// 过期时间命令
 	DefaultRegistry.Register("TTL", &TtlCommand{})

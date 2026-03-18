@@ -633,6 +633,7 @@ func (db *Database) Close() error {
 func (db *Database) GetStats() map[string]interface{} {
 	stats := make(map[string]interface{})
 
+	stats["db_id"] = db.id
 	keyCount := 0
 	for i := 0; i < ShardCount; i++ {
 		shard := &db.shards[i]
@@ -641,11 +642,14 @@ func (db *Database) GetStats() map[string]interface{} {
 		shard.lock.RUnlock()
 	}
 	stats["memory_keys"] = keyCount
+	stats["used_memory_bytes"] = atomic.LoadInt64(&db.usedMemory)
+	stats["max_memory_bytes"] = db.maxMemory
+	stats["max_memory_policy"] = db.evictionPolicy
 
 	if db.lsmEngine != nil {
 		stats["mode"] = "LSM"
-		// TODO: 添加 LSM 引擎的 GetStats 方法
 		stats["lsm_enabled"] = true
+		stats["lsm"] = db.lsmEngine.GetStats()
 	} else {
 		stats["mode"] = "Memory"
 		stats["lsm_enabled"] = false
