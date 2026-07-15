@@ -14,6 +14,7 @@ type SSTableBuilder struct {
 	dataBlocks   []BlockHandle // 数据 Block 句柄
 	indexBlock   *BlockBuilder // Index Block Builder
 	firstKey     []byte        // 当前 Block 的第一个 key
+	smallestKey  []byte        // SSTable 的最小 key
 	lastKey      []byte        // 上一个 key（用于判断是否需要添加到 Index）
 	entryCount   int           // 条目计数
 	fileSize     int64         // 当前文件大小
@@ -29,7 +30,7 @@ func NewSSTableBuilder(filename string, options *Options) (*SSTableBuilder, erro
 	}
 
 	// 创建文件
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -45,6 +46,7 @@ func NewSSTableBuilder(filename string, options *Options) (*SSTableBuilder, erro
 		dataBlocks:   make([]BlockHandle, 0),
 		indexBlock:   NewBlockBuilder(options),
 		firstKey:     nil,
+		smallestKey:  nil,
 		lastKey:      nil,
 		entryCount:   0,
 		fileSize:     0,
@@ -70,6 +72,9 @@ func (b *SSTableBuilder) Add(key, value []byte) error {
 	// 如果是当前 Block 的第一个条目，记录 firstKey
 	if b.blockBuilder.Empty() {
 		b.firstKey = append(b.firstKey[:0], key...)
+	}
+	if b.entryCount == 0 {
+		b.smallestKey = append(b.smallestKey[:0], key...)
 	}
 
 	// 添加到 Data Block
@@ -264,6 +269,20 @@ func (b *SSTableBuilder) Abort() {
 // FileSize 返回当前文件大小
 func (b *SSTableBuilder) FileSize() int64 {
 	return b.fileSize
+}
+
+func (b *SSTableBuilder) SmallestKey() []byte {
+	if b.smallestKey == nil {
+		return nil
+	}
+	return append([]byte(nil), b.smallestKey...)
+}
+
+func (b *SSTableBuilder) LargestKey() []byte {
+	if b.lastKey == nil {
+		return nil
+	}
+	return append([]byte(nil), b.lastKey...)
 }
 
 // 错误定义

@@ -102,7 +102,7 @@ func FileExists(path string) bool {
 
 // CreateDir 创建目录（如果不存在）
 func CreateDir(path string) error {
-	return os.MkdirAll(path, 0755)
+	return os.MkdirAll(path, 0750)
 }
 
 // GetFileSize 获取文件大小

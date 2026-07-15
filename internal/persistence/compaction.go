@@ -189,6 +189,7 @@ func (c *Compactor) levelMaxSize(level int) int64 {
 
 // runCompaction 执行 Compaction
 func (c *Compactor) runCompaction(level int) error {
+	start := time.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -203,6 +204,9 @@ func (c *Compactor) runCompaction(level int) error {
 	// 更新统计
 	c.stats.NumCompactions++
 	c.stats.NumFilesMerged += int64(len(inputFiles))
+	for _, fm := range inputFiles {
+		c.stats.BytesRead += fm.Size
+	}
 
 	// 计算 key 范围
 	smallestKey, largestKey := c.computeKeyRange(inputFiles)
@@ -215,6 +219,9 @@ func (c *Compactor) runCompaction(level int) error {
 	}
 
 	overlapFiles := c.findOverlapFiles(version.Files[outputLevel], smallestKey, largestKey)
+	for _, fm := range overlapFiles {
+		c.stats.BytesRead += fm.Size
+	}
 	if level == 0 {
 		for i := 0; i < 8; i++ {
 			all := make([]*FileMetadata, 0, len(inputFiles)+len(overlapFiles))
@@ -243,6 +250,9 @@ func (c *Compactor) runCompaction(level int) error {
 	if err != nil {
 		return err
 	}
+	if outputFileNum != nil {
+		c.stats.BytesWritten += outputFileNum.Size
+	}
 
 	// 更新版本和 MANIFEST
 	err = c.finishCompaction(inputFiles, level, []*FileMetadata{outputFileNum})
@@ -250,6 +260,7 @@ func (c *Compactor) runCompaction(level int) error {
 		return err
 	}
 
+	c.stats.DurationMs += time.Since(start).Milliseconds()
 	return nil
 }
 
@@ -498,6 +509,9 @@ func (c *Compactor) mergeFiles(inputFiles, overlapFiles []*FileMetadata, outputL
 		return nil, err
 	}
 
+	smallestKey = builder.SmallestKey()
+	largestKey = builder.LargestKey()
+
 	// 创建文件元数据
 	outputFM := &FileMetadata{
 		FileNum:     fileNum,
@@ -519,7 +533,6 @@ func (c *Compactor) mergeFiles(inputFiles, overlapFiles []*FileMetadata, outputL
 func (c *Compactor) finishCompaction(inputFiles []*FileMetadata, inputLevel int, outputFiles []*FileMetadata) error {
 	// 从旧层级移除输入文件
 	for _, fm := range inputFiles {
-		c.versionSet.GetCurrentVersion().RemoveFile(inputLevel, fm.FileNum)
 		err := c.versionSet.LogDeleteFile(inputLevel, fm.FileNum)
 		if err != nil {
 			return err
@@ -532,7 +545,6 @@ func (c *Compactor) finishCompaction(inputFiles []*FileMetadata, inputLevel int,
 
 	// 添加输出文件到新层级
 	for _, fm := range outputFiles {
-		c.versionSet.GetCurrentVersion().AddFile(fm.Level, fm)
 		err := c.versionSet.LogAddFile(fm)
 		if err != nil {
 			return err

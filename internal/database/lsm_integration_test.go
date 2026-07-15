@@ -3,7 +3,6 @@ package database
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"testing"
 
 	//"time"
@@ -13,7 +12,7 @@ import (
 	"github.com/TZJ-BYTE/RediGo/internal/persistence"
 )
 
-// TestLSMIntegration 测试 LSM 引擎集成
+// TestLSMIntegration 测试持久化引擎集成
 func TestLSMIntegration(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -72,14 +71,14 @@ func TestLSMIntegration(t *testing.T) {
 
 	// 测试统计信息
 	stats := db.GetStats()
-	if stats["mode"] != "LSM" {
-		t.Error("Expected LSM mode")
+	if stats["mode"] != "Rust" {
+		t.Errorf("expected Rust mode, got %v", stats["mode"])
 	}
 
 	t.Logf("Database stats: %+v", stats)
 }
 
-// TestLSMRecovery 测试 LSM 恢复
+// TestLSMRecovery 测试持久化恢复
 func TestLSMRecovery(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -105,26 +104,9 @@ func TestLSMRecovery(t *testing.T) {
 		}
 	}
 
-	// 强制刷写到 SSTable（通过触发 MemTable 刷写）
-	// 注意：当前实现在 Close 时会自动刷写，所以我们直接关闭
 	t.Log("Closing first database instance...")
 	db1.Close()
 
-	// 删除 WAL 文件，强制从 SSTable 恢复
-	walFile := filepath.Join(tmpDir, "wal", "current.wal")
-
-	// 等待文件释放（Windows 特别需要）
-	// 在测试中，由于 db1.Close() 可能没有完全释放所有文件句柄（特别是 WAL），
-	// 这里可能需要一点延迟或者重试
-
-	err = os.Remove(walFile)
-	if err != nil && !os.IsNotExist(err) {
-		t.Logf("Warning: Failed to remove WAL file: %v", err)
-	} else {
-		t.Log("WAL file removed, forcing recovery from SSTable only")
-	}
-
-	// 重新打开数据库（应该从 SSTable 恢复）
 	t.Log("Reopening database for recovery test...")
 	db2, err := NewDatabaseWithConfig(0, config)
 	if err != nil {
@@ -132,13 +114,6 @@ func TestLSMRecovery(t *testing.T) {
 	}
 	defer db2.Close()
 
-	// 等待一下，也许是某种竞态？
-	// time.Sleep(100 * time.Millisecond)
-
-	// 尝试手动全量加载 (Hack: 通过反射调用 loadAllFromLSM)
-	// 或者，我们假设 lazy_load 已经生效（我们在 NewDatabaseWithConfig 中强制了）
-
-	// 检查 keys
 	keys := db2.Keys()
 	t.Logf("DB2 Keys after reopen: %v", keys)
 
@@ -176,11 +151,11 @@ func TestLSMRecovery(t *testing.T) {
 	if missingKeys > 0 {
 		t.Errorf("Data loss detected: %d keys not recovered from SSTable", missingKeys)
 	} else {
-		t.Logf("✅ All data successfully recovered from SSTable")
+		t.Logf("All data successfully recovered from Rust engine")
 	}
 }
 
-// TestDBManagerWithLSM 测试 DBManager 集成 LSM
+// TestDBManagerWithLSM 测试 DBManager 集成持久化引擎
 func TestDBManagerWithLSM(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -188,7 +163,7 @@ func TestDBManagerWithLSM(t *testing.T) {
 	cfg := &config.Config{
 		DBCount:            2,
 		PersistenceEnabled: true,
-		PersistenceType:    "lsm",
+		PersistenceType:    "rust",
 		DataDir:            tmpDir,
 		BlockSize:          4096,
 		MemTableSize:       4 << 20,

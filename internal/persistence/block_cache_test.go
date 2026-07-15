@@ -12,9 +12,10 @@ func TestBlockCache_Basic(t *testing.T) {
 	// 测试 Put 和 Get
 	key := uint64(1)
 	value := []byte("test_value")
-	size := len(value)
+	block := NewBlock(value)
+	size := block.Size()
 
-	cache.Put(key, value, size)
+	cache.Put(key, block, size)
 
 	// 验证可以获取
 	val, ok := cache.Get(key)
@@ -22,8 +23,8 @@ func TestBlockCache_Basic(t *testing.T) {
 		t.Fatal("Expected to find key in cache")
 	}
 
-	if !bytes.Equal(val.([]byte), value) {
-		t.Errorf("Expected %s, got %s", string(value), string(val.([]byte)))
+	if !bytes.Equal(val.Data(), value) {
+		t.Errorf("Expected %s, got %s", string(value), string(val.Data()))
 	}
 
 	// 验证大小
@@ -44,7 +45,8 @@ func TestBlockCache_LRU(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		key := uint64(i)
 		value := []byte(fmt.Sprintf("value_%d", i))
-		cache.Put(key, value, len(value))
+		block := NewBlock(value)
+		cache.Put(key, block, block.Size())
 	}
 
 	// 验证只有最近的几个条目在缓存中
@@ -77,12 +79,14 @@ func TestBlockCache_Update(t *testing.T) {
 	key := uint64(1)
 	value1 := []byte("value1")
 	value2 := []byte("value2_updated")
+	block1 := NewBlock(value1)
+	block2 := NewBlock(value2)
 
 	// 第一次 Put
-	cache.Put(key, value1, len(value1))
+	cache.Put(key, block1, block1.Size())
 
 	// 更新
-	cache.Put(key, value2, len(value2))
+	cache.Put(key, block2, block2.Size())
 
 	// 验证更新后的值
 	val, ok := cache.Get(key)
@@ -90,12 +94,12 @@ func TestBlockCache_Update(t *testing.T) {
 		t.Fatal("Expected to find key in cache")
 	}
 
-	if !bytes.Equal(val.([]byte), value2) {
-		t.Errorf("Expected %s, got %s", string(value2), string(val.([]byte)))
+	if !bytes.Equal(val.Data(), value2) {
+		t.Errorf("Expected %s, got %s", string(value2), string(val.Data()))
 	}
 
 	// 验证大小正确更新
-	expectedSize := int64(len(value2))
+	expectedSize := int64(block2.Size())
 	if cache.Size() != expectedSize {
 		t.Errorf("Expected size %d, got %d", expectedSize, cache.Size())
 	}
@@ -106,8 +110,9 @@ func TestBlockCache_Delete(t *testing.T) {
 
 	key := uint64(1)
 	value := []byte("test_value")
+	block := NewBlock(value)
 
-	cache.Put(key, value, len(value))
+	cache.Put(key, block, block.Size())
 
 	// 验证存在
 	if _, ok := cache.Get(key); !ok {
@@ -135,7 +140,8 @@ func TestBlockCache_Clear(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		key := uint64(i)
 		value := []byte(fmt.Sprintf("value%d", i))
-		cache.Put(key, value, len(value))
+		block := NewBlock(value)
+		cache.Put(key, block, block.Size())
 	}
 
 	// 验证有数据
@@ -166,12 +172,13 @@ func TestBlockCache_HitRate(t *testing.T) {
 
 	key := uint64(1)
 	value := []byte("test_value")
+	block := NewBlock(value)
 
 	// Miss
 	cache.Get(key)
 
 	// Put
-	cache.Put(key, value, len(value))
+	cache.Put(key, block, block.Size())
 
 	// Hit
 	cache.Get(key)
@@ -203,7 +210,8 @@ func TestBlockCache_Resize(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		key := uint64(i)
 		value := []byte(fmt.Sprintf("value_%d", i))
-		cache.Put(key, value, len(value))
+		block := NewBlock(value)
+		cache.Put(key, block, block.Size())
 	}
 
 	initialLen := cache.Len()
@@ -233,7 +241,8 @@ func TestBlockCache_Eviction(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		key := uint64(i)
 		value := []byte(fmt.Sprintf("value_%d_with_some_length", i))
-		cache.Put(key, value, len(value))
+		block := NewBlock(value)
+		cache.Put(key, block, block.Size())
 	}
 
 	// 验证缓存大小不超过限制
@@ -255,11 +264,12 @@ func TestBlockCache_Eviction(t *testing.T) {
 func BenchmarkBlockCache_Put(b *testing.B) {
 	cache := NewBlockCache(1024 * 1024) // 1MB
 	value := []byte("test_value_for_benchmark")
+	block := NewBlock(value)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		key := uint64(i)
-		cache.Put(key, value, len(value))
+		cache.Put(key, block, block.Size())
 	}
 }
 
@@ -267,9 +277,10 @@ func BenchmarkBlockCache_Get(b *testing.B) {
 	cache := NewBlockCache(1024 * 1024)
 	key := uint64(1)
 	value := []byte("test_value_for_benchmark")
+	block := NewBlock(value)
 
 	// 先放入缓存
-	cache.Put(key, value, len(value))
+	cache.Put(key, block, block.Size())
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -280,14 +291,14 @@ func BenchmarkBlockCache_Get(b *testing.B) {
 func TestBlockCache_SLRUPreferEvictProbation(t *testing.T) {
 	cache := NewBlockCacheWithPolicy(2, 0.5, 1000)
 
-	cache.Put(1, []byte("a"), 1)
-	cache.Put(2, []byte("b"), 1)
+	cache.Put(1, NewBlock([]byte("a")), 1)
+	cache.Put(2, NewBlock([]byte("b")), 1)
 
 	if _, ok := cache.Get(1); !ok {
 		t.Fatal("Expected key 1 to be in cache")
 	}
 
-	cache.Put(3, []byte("c"), 1)
+	cache.Put(3, NewBlock([]byte("c")), 1)
 
 	if _, ok := cache.Get(1); !ok {
 		t.Fatal("Expected key 1 to still be in cache")

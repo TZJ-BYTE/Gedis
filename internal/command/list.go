@@ -4,7 +4,6 @@ import (
 	"errors"
 
 	"github.com/TZJ-BYTE/RediGo/internal/database"
-	"github.com/TZJ-BYTE/RediGo/internal/datastruct"
 	"github.com/TZJ-BYTE/RediGo/internal/protocol"
 )
 
@@ -17,34 +16,15 @@ func (c *LPushCommand) Execute(db *database.Database, args [][]byte) *protocol.R
 	}
 
 	key := argString(args, 0)
-
-	value, exists := db.Get(key)
-	var list *datastruct.List
-
-	if !exists {
-		list = &datastruct.List{
-			Data: make([]string, 0),
-		}
-	} else {
-		l, ok := value.Value.(*datastruct.List)
-		if !ok {
-			return protocol.MakeError(errors.New("WRONGTYPE Operation against a key holding the wrong kind of value"))
-		}
-		list = l
-	}
-
+	vals := make([]string, 0, len(args)-1)
 	for i := 1; i < len(args); i++ {
-		list.PushLeft(argString(args, i))
+		vals = append(vals, argString(args, i))
 	}
-
-	if err := db.Set(key, &datastruct.DataValue{
-		Value:      list,
-		ExpireTime: 0,
-	}); err != nil {
+	n, err := db.LPush(key, vals)
+	if err != nil {
 		return protocol.MakeError(err)
 	}
-
-	return protocol.MakeInteger(int64(len(list.Data)))
+	return protocol.MakeInteger(int64(n))
 }
 
 // RPushCommand RPUSH 命令
@@ -56,34 +36,15 @@ func (c *RPushCommand) Execute(db *database.Database, args [][]byte) *protocol.R
 	}
 
 	key := argString(args, 0)
-
-	value, exists := db.Get(key)
-	var list *datastruct.List
-
-	if !exists {
-		list = &datastruct.List{
-			Data: make([]string, 0),
-		}
-	} else {
-		l, ok := value.Value.(*datastruct.List)
-		if !ok {
-			return protocol.MakeError(errors.New("WRONGTYPE Operation against a key holding the wrong kind of value"))
-		}
-		list = l
-	}
-
+	vals := make([]string, 0, len(args)-1)
 	for i := 1; i < len(args); i++ {
-		list.PushRight(argString(args, i))
+		vals = append(vals, argString(args, i))
 	}
-
-	if err := db.Set(key, &datastruct.DataValue{
-		Value:      list,
-		ExpireTime: 0,
-	}); err != nil {
+	n, err := db.RPush(key, vals)
+	if err != nil {
 		return protocol.MakeError(err)
 	}
-
-	return protocol.MakeInteger(int64(len(list.Data)))
+	return protocol.MakeInteger(int64(n))
 }
 
 // LPopCommand LPOP 命令
@@ -95,22 +56,13 @@ func (c *LPopCommand) Execute(db *database.Database, args [][]byte) *protocol.Re
 	}
 
 	key := argString(args, 0)
-
-	value, exists := db.Get(key)
-	if !exists {
-		return protocol.MakeNull()
+	val, ok, err := db.LPop(key)
+	if err != nil {
+		return protocol.MakeError(err)
 	}
-
-	list, ok := value.Value.(*datastruct.List)
 	if !ok {
-		return protocol.MakeError(errors.New("WRONGTYPE Operation against a key holding the wrong kind of value"))
-	}
-
-	val, success := list.PopLeft()
-	if !success {
 		return protocol.MakeNull()
 	}
-
 	return protocol.MakeBulkString(val)
 }
 
@@ -123,22 +75,13 @@ func (c *RPopCommand) Execute(db *database.Database, args [][]byte) *protocol.Re
 	}
 
 	key := argString(args, 0)
-
-	value, exists := db.Get(key)
-	if !exists {
-		return protocol.MakeNull()
+	val, ok, err := db.RPop(key)
+	if err != nil {
+		return protocol.MakeError(err)
 	}
-
-	list, ok := value.Value.(*datastruct.List)
 	if !ok {
-		return protocol.MakeError(errors.New("WRONGTYPE Operation against a key holding the wrong kind of value"))
-	}
-
-	val, success := list.PopRight()
-	if !success {
 		return protocol.MakeNull()
 	}
-
 	return protocol.MakeBulkString(val)
 }
 
@@ -151,18 +94,11 @@ func (c *LLenCommand) Execute(db *database.Database, args [][]byte) *protocol.Re
 	}
 
 	key := argString(args, 0)
-
-	value, exists := db.Get(key)
-	if !exists {
-		return protocol.MakeInteger(0)
+	n, err := db.LLen(key)
+	if err != nil {
+		return protocol.MakeError(err)
 	}
-
-	list, ok := value.Value.(*datastruct.List)
-	if !ok {
-		return protocol.MakeError(errors.New("WRONGTYPE Operation against a key holding the wrong kind of value"))
-	}
-
-	return protocol.MakeInteger(int64(len(list.Data)))
+	return protocol.MakeInteger(int64(n))
 }
 
 // LRangeCommand LRANGE 命令
@@ -176,18 +112,10 @@ func (c *LRangeCommand) Execute(db *database.Database, args [][]byte) *protocol.
 	key := argString(args, 0)
 	start := parseIntBytes(args[1])
 	stop := parseIntBytes(args[2])
-
-	value, exists := db.Get(key)
-	if !exists {
-		return protocol.MakeArray([]string{})
+	result, err := db.LRange(key, start, stop)
+	if err != nil {
+		return protocol.MakeError(err)
 	}
-
-	list, ok := value.Value.(*datastruct.List)
-	if !ok {
-		return protocol.MakeError(errors.New("WRONGTYPE Operation against a key holding the wrong kind of value"))
-	}
-
-	result := list.Range(start, stop)
 	return protocol.MakeArray(result)
 }
 

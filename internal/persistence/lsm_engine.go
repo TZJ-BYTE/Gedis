@@ -13,6 +13,8 @@ import (
 	"github.com/TZJ-BYTE/RediGo/pkg/logger"
 )
 
+var errLegacyLSMDisabled = fmt.Errorf("legacy LSM engine is disabled; use engine_v2 instead")
+
 // LSMEnergy LSM 引擎
 type LSMEnergy struct {
 	options *Options     // 配置选项
@@ -52,6 +54,7 @@ type LSMEnergy struct {
 	closed    atomic.Bool
 	closeOnce sync.Once
 	bgWG      sync.WaitGroup
+	flushWG   sync.WaitGroup
 
 	// 后台刷写同步
 	flushing  atomic.Bool   // 是否正在刷写
@@ -66,10 +69,239 @@ type LSMEnergy struct {
 	writesThisSec    atomic.Uint64
 	writeOpsPerSec   atomic.Uint64
 	cacheHitPermille atomic.Uint32
+
+	flushCount         atomic.Uint64
+	flushBytesWritten  atomic.Uint64
+	flushDurationNanos atomic.Uint64
+	flushErrors        atomic.Uint64
+}
+
+func (e *LSMEnergy) Reset() error {
+	if e == nil {
+		return fmt.Errorf("nil engine")
+	}
+	if e.options == nil {
+		e.options = DefaultOptions()
+	}
+
+	if e.closed.Load() {
+		return fmt.Errorf("engine is closed")
+	}
+
+	e.mu.Lock()
+	e.closed.Store(true)
+	e.mu.Unlock()
+
+	safeClose := func(ch chan struct{}) {
+		defer func() { _ = recover() }()
+		close(ch)
+	}
+
+	safeClose(e.gcStop)
+	safeClose(e.bgStop)
+
+	if e.compactor != nil {
+		e.compactor.Stop()
+		e.compactor = nil
+	}
+
+	e.bgWG.Wait()
+	e.flushWG.Wait()
+
+	e.mu.Lock()
+	unlocked := false
+	defer func() {
+		if !unlocked {
+			e.mu.Unlock()
+		}
+	}()
+
+	if e.offloader != nil && e.versionSet != nil {
+		v := e.versionSet.GetCurrentVersion()
+		if v != nil {
+			for level := 0; level < len(v.Files); level++ {
+				for _, fm := range v.Files[level] {
+					if fm != nil {
+						_ = e.offloader.DeleteRemote(fm.FileNum)
+					}
+				}
+			}
+		}
+	}
+
+	if e.wal != nil {
+		_ = e.wal.Close()
+		e.wal = nil
+	}
+	if e.tableCache != nil {
+		_ = e.tableCache.Close()
+	}
+	if e.versionSet != nil {
+		_ = e.versionSet.Close()
+		e.versionSet = nil
+	}
+	if e.vLogReader != nil {
+		_ = e.vLogReader.Close()
+		e.vLogReader = nil
+	}
+	if e.vLogWriter != nil {
+		_ = e.vLogWriter.Close()
+		e.vLogWriter = nil
+	}
+
+	versionDir := filepath.Join(e.dbDir, "version")
+	dirs := []string{e.walDir, e.sstableDir, e.vlogDir, versionDir}
+	for _, dir := range dirs {
+		if err := os.RemoveAll(dir); err != nil {
+			return err
+		}
+		if err := os.MkdirAll(dir, 0750); err != nil {
+			return err
+		}
+	}
+
+	_ = e.options.Validate()
+	e.mutableMem = NewMemTable(e.options.MemTableSize)
+	e.immutableMem = nil
+	atomic.StoreUint64(&e.seqNum, 0)
+	e.nextSSTableNum = 0
+
+	e.flushDone = make(chan struct{}, 1)
+
+	var err error
+	e.vLogWriter, err = vlog.NewValueLogWriter(e.vlogDir, 64*1024*1024)
+	if err != nil {
+		return fmt.Errorf("failed to open value log writer: %v", err)
+	}
+	e.vLogReader = vlog.NewValueLogReader(e.vlogDir)
+
+	checkKeyFunc := func(key []byte, vp *vlog.ValuePointer) (bool, error) {
+		currentValPtrBytes, found := e.getRaw(key)
+		if !found {
+			return false, nil
+		}
+		if IsDeleted(currentValPtrBytes) {
+			return false, nil
+		}
+		currentVP := vlog.DecodeValuePointer(currentValPtrBytes)
+		if currentVP == nil {
+			return false, nil
+		}
+		if currentVP.Fid == vp.Fid && currentVP.Offset == vp.Offset {
+			return true, nil
+		}
+		return false, nil
+	}
+
+	rewriteFunc := func(key, value []byte, oldVP *vlog.ValuePointer) error {
+		newVP, err := e.vLogWriter.Write(key, value)
+		if err != nil {
+			return err
+		}
+
+		e.mu.Lock()
+		defer e.mu.Unlock()
+
+		if e.closed.Load() {
+			return fmt.Errorf("engine closed")
+		}
+
+		currentValPtrBytes, found := e.getRawNoLock(key)
+		if !found || IsDeleted(currentValPtrBytes) {
+			return nil
+		}
+		currentVP := vlog.DecodeValuePointer(currentValPtrBytes)
+		if currentVP == nil {
+			return nil
+		}
+
+		if oldVP == nil {
+			return nil
+		}
+		if currentVP.Fid != oldVP.Fid || currentVP.Offset != oldVP.Offset || currentVP.Len != oldVP.Len {
+			return nil
+		}
+
+		e.mutableMem.Put(key, newVP.Encode())
+		return nil
+	}
+
+	e.vLogGC = vlog.NewValueLogGC(e.vlogDir, 0.5, checkKeyFunc, rewriteFunc)
+
+	if e.tableCache == nil {
+		e.tableCache = NewTableCache(e.options.MaxOpenFiles)
+	} else {
+		e.tableCache = NewTableCache(e.options.MaxOpenFiles)
+	}
+	if e.options.UseCache {
+		if e.blockCache == nil {
+			e.blockCache = NewBlockCache(int64(e.options.CacheSize))
+		} else {
+			e.blockCache.Resize(int64(e.options.CacheSize))
+			e.blockCache.Clear()
+		}
+	} else {
+		e.blockCache = nil
+	}
+
+	e.versionSet, err = OpenVersionSet(e.dbDir, MaxLevels)
+	if err != nil {
+		return fmt.Errorf("failed to open version set: %v", err)
+	}
+	e.nextSSTableNum = e.versionSet.nextFileNum
+
+	e.heat = NewHeatTracker(time.Duration(e.options.HotColdDecayIntervalSeconds)*time.Second, e.options.HotColdDecayFactor)
+	e.offloader, err = NewSSTableOffloader(e.options, e.sstableDir)
+	if err != nil {
+		return fmt.Errorf("failed to init offloader: %v", err)
+	}
+
+	e.compactor = NewCompactor(e.dbDir, e.versionSet, e.options, e.heat.Get, func(fm *FileMetadata) error {
+		if e.offloader == nil {
+			return nil
+		}
+		if !e.allowOffload() {
+			return nil
+		}
+		return e.offloader.OffloadIfNeeded(fm)
+	})
+	e.compactor.SetThrottle(func(level int) (bool, time.Duration) {
+		return e.allowCompaction(level)
+	})
+
+	e.gcStop = make(chan struct{})
+	e.bgStop = make(chan struct{})
+	e.bgWG = sync.WaitGroup{}
+
+	err = e.recoverFromWAL()
+	if err != nil {
+		return fmt.Errorf("failed to recover from WAL: %v", err)
+	}
+
+	e.closed.Store(false)
+	unlocked = true
+	e.mu.Unlock()
+
+	if e.compactor != nil {
+		e.compactor.Start()
+	}
+
+	e.bgWG.Add(2)
+	go func() {
+		defer e.bgWG.Done()
+		e.runGC()
+	}()
+	go func() {
+		defer e.bgWG.Done()
+		e.runBackgroundScheduler()
+	}()
+	return nil
 }
 
 // OpenLSMEnergy 打开 LSM 引擎
 func OpenLSMEnergy(dbDir string, options *Options) (*LSMEnergy, error) {
+        return nil, errLegacyLSMDisabled
+
 	if options == nil {
 		options = DefaultOptions()
 	}
@@ -77,7 +309,7 @@ func OpenLSMEnergy(dbDir string, options *Options) (*LSMEnergy, error) {
 
 	engine := &LSMEnergy{
 		options:        options,
-		mutableMem:     NewMemTable(3), // 默认 maxLevel=3
+		mutableMem:     NewMemTable(options.MemTableSize),
 		nextSSTableNum: 0,
 		dbDir:          dbDir,
 		walDir:         filepath.Join(dbDir, "wal"),
@@ -123,25 +355,25 @@ func OpenLSMEnergy(dbDir string, options *Options) (*LSMEnergy, error) {
 	}
 
 	// 创建目录
-	err := os.MkdirAll(dbDir, 0755)
+	err := os.MkdirAll(dbDir, 0750)
 	if err != nil {
 		cleanup()
 		return nil, err
 	}
 
-	err = os.MkdirAll(engine.walDir, 0755)
+	err = os.MkdirAll(engine.walDir, 0750)
 	if err != nil {
 		cleanup()
 		return nil, err
 	}
 
-	err = os.MkdirAll(engine.sstableDir, 0755)
+	err = os.MkdirAll(engine.sstableDir, 0750)
 	if err != nil {
 		cleanup()
 		return nil, err
 	}
 
-	err = os.MkdirAll(engine.vlogDir, 0755)
+	err = os.MkdirAll(engine.vlogDir, 0750)
 	if err != nil {
 		cleanup()
 		return nil, err
@@ -190,7 +422,7 @@ func OpenLSMEnergy(dbDir string, options *Options) (*LSMEnergy, error) {
 	}
 
 	// 2. 重写数据的回调
-	rewriteFunc := func(key, value []byte) error {
+	rewriteFunc := func(key, value []byte, oldVP *vlog.ValuePointer) error {
 		// 写入新的 vLog
 		// 必须使用一个新的内部方法，不能调用 engine.Put，因为 engine.Put 会尝试获取 engine.mu 锁
 		// 而 runGC 是在后台运行的，虽然 runGC 本身不持有锁，但如果在高并发下
@@ -213,7 +445,7 @@ func OpenLSMEnergy(dbDir string, options *Options) (*LSMEnergy, error) {
 		// 为了避免写 WAL，我们手动实现逻辑。
 
 		// 1. 写 vLog
-		vp, err := engine.vLogWriter.Write(key, value)
+		newVP, err := engine.vLogWriter.Write(key, value)
 		if err != nil {
 			return err
 		}
@@ -273,31 +505,14 @@ func OpenLSMEnergy(dbDir string, options *Options) (*LSMEnergy, error) {
 			return nil
 		}
 
-		// 如果当前的 VP 指向的文件 ID 比较大（比我们正在 GC 的文件新），说明已经被更新过
-		// 我们应该放弃。
-		// 但我们不知道正在 GC 的文件 ID。
-		// 这是一个死结，除非修改 ValueLogGC 接口。
+		if oldVP == nil {
+			return nil
+		}
+		if currentVP.Fid != oldVP.Fid || currentVP.Offset != oldVP.Offset || currentVP.Len != oldVP.Len {
+			return nil
+		}
 
-		// 假设：ValueLogGC 总是从最旧的文件开始 GC。
-		// 那么只要 currentVP.Fid > vp.Fid，就说明已更新。
-		// 但是我们拿不到 vp.Fid。
-
-		// 妥协方案：
-		// 仅当 Key 存在且未删除时更新。这无法解决“用户更新了小 Value 但我们覆盖为旧的大 Value”的问题。
-		// 但考虑到 ValueThreshold 是配置项，通常不会变。
-
-		// 既然我们无法完美解决，我们暂时使用 engine.Put，并接受 WAL 开销。
-		// 至于并发更新问题，engine.Put 会加锁，并在 MemTable 中追加新条目。
-		// 即使是旧值，也会被追加。这确实会导致数据回滚。
-
-		// 修正方案：修改 ValueLogGC，让 rewriteFunc 接收原始 VP。
-		// 但现在为了不动 vlog 包（避免破坏性变更），我们先实现一个安全的 getRawNoLock
-		// 并尽力检查。
-
-		// 由于时间限制，我们先确保 basic concurrency safety (locking)。
-		// 逻辑正确性留待后续优化。
-
-		engine.mutableMem.Put(key, vp.Encode())
+		engine.mutableMem.Put(key, newVP.Encode())
 		return nil
 	}
 
@@ -373,7 +588,7 @@ func (e *LSMEnergy) recoverFromWAL() error {
 	if !WALExists(walFile) {
 		// 没有 WAL 文件，创建新的
 		var err error
-		e.wal, err = NewWALWriter(walFile, int64(64*1024*1024), e.options.SyncWAL) // 默认 64MB
+		e.wal, err = NewWALWriterWithConfig(walFile, int64(64*1024*1024), e.options.SyncWAL, e.options.WALQueueSize, time.Duration(e.options.WALWriteTimeoutMs)*time.Millisecond)
 		if err != nil {
 			return err
 		}
@@ -399,13 +614,13 @@ func (e *LSMEnergy) recoverFromWAL() error {
 	atomic.StoreUint64(&e.seqNum, lastSeq)
 
 	// 创建新的 WAL 写入器
-	e.wal, err = NewWALWriter(walFile, int64(64*1024*1024), e.options.SyncWAL)
+	e.wal, err = NewWALWriterWithConfig(walFile, int64(64*1024*1024), e.options.SyncWAL, e.options.WALQueueSize, time.Duration(e.options.WALWriteTimeoutMs)*time.Millisecond)
 	if err != nil {
 		return err
 	}
 
 	// 检查是否需要刷写 MemTable
-	if int64(e.mutableMem.Size()) >= int64(4*1024*1024) { // 默认 4MB
+	if e.mutableMem.IsFull() {
 		err = e.flushMemTable()
 		if err != nil {
 			return fmt.Errorf("failed to flush memtable during recovery: %v", err)
@@ -648,7 +863,7 @@ func (e *LSMEnergy) Put(key, value []byte) error {
 	_ = seq // 暂时不使用
 
 	// 5. 检查是否需要刷写
-	if int64(e.mutableMem.Size()) >= int64(4*1024*1024) { // 默认 4MB
+	if e.mutableMem.IsFull() {
 		err = e.flushMemTable()
 		if err != nil {
 			return fmt.Errorf("failed to flush memtable: %v", err)
@@ -835,7 +1050,7 @@ func (e *LSMEnergy) Delete(key []byte) error {
 	_ = seq
 
 	// 4. 检查是否需要刷写
-	if int64(e.mutableMem.Size()) >= int64(4*1024*1024) { // 默认 4MB
+	if e.mutableMem.IsFull() {
 		err = e.flushMemTable()
 		if err != nil {
 			return fmt.Errorf("failed to flush memtable: %v", err)
@@ -863,7 +1078,7 @@ func (e *LSMEnergy) flushMemTableSyncNoLock() error {
 	e.immutableMem = NewImmutableMemTable(oldMem)
 
 	// 2. 创建新的 Mutable MemTable
-	e.mutableMem = NewMemTable(3)
+	e.mutableMem = NewMemTable(e.options.MemTableSize)
 
 	// 3. 同步刷写（不启动 goroutine）
 	imm := e.immutableMem // 保存引用用于后续释放
@@ -897,10 +1112,12 @@ func (e *LSMEnergy) flushMemTable() error {
 	e.immutableMem = NewImmutableMemTable(oldMem)
 
 	// 2. 创建新的 Mutable MemTable
-	e.mutableMem = NewMemTable(3) // 默认 maxLevel=3
+	e.mutableMem = NewMemTable(e.options.MemTableSize)
 
 	// 3. 异步刷写 Immutable MemTable 到 SSTable
+	e.flushWG.Add(1)
 	go func(imm *ImmutableMemTable) {
+		defer e.flushWG.Done()
 		defer func() {
 			imm.Unref() // 减少引用计数
 			// 发送刷写完成信号
@@ -926,6 +1143,7 @@ func (e *LSMEnergy) flushMemTable() error {
 
 // flushImmutableToSSTable 将 Immutable MemTable 刷写到 SSTable
 func (e *LSMEnergy) flushImmutableToSSTable(imm *ImmutableMemTable) error {
+	start := time.Now()
 	// 生成 SSTable 文件名
 	sstableNum := e.versionSet.GetNextFileNum()
 	filename := filepath.Join(e.sstableDir, fmt.Sprintf("%06d.sstable", sstableNum))
@@ -933,6 +1151,7 @@ func (e *LSMEnergy) flushImmutableToSSTable(imm *ImmutableMemTable) error {
 	// 创建 SSTable Builder
 	builder, err := NewSSTableBuilder(filename, e.options)
 	if err != nil {
+		e.flushErrors.Add(1)
 		return fmt.Errorf("failed to create sstable builder: %v", err)
 	}
 	defer builder.Abort() // 如果出错则回滚
@@ -943,18 +1162,21 @@ func (e *LSMEnergy) flushImmutableToSSTable(imm *ImmutableMemTable) error {
 		return builder.Add(key, value)
 	})
 	if err != nil {
+		e.flushErrors.Add(1)
 		return fmt.Errorf("failed to iterate immutable memtable: %v", err)
 	}
 
 	// 完成 SSTable 构建
 	err = builder.Finish()
 	if err != nil {
+		e.flushErrors.Add(1)
 		return fmt.Errorf("failed to finish sstable: %v", err)
 	}
 
 	sstablePath := filepath.Join(e.sstableDir, fmt.Sprintf("%06d.sstable", sstableNum))
 	reader, err := OpenSSTableForReadWithCache(sstableNum, sstablePath, e.options, e.blockCache)
 	if err != nil {
+		e.flushErrors.Add(1)
 		return fmt.Errorf("failed to open sstable reader: %v", err)
 	}
 
@@ -962,6 +1184,7 @@ func (e *LSMEnergy) flushImmutableToSSTable(imm *ImmutableMemTable) error {
 	info, err := os.Stat(filename)
 	if err != nil {
 		reader.Close()
+		e.flushErrors.Add(1)
 		return fmt.Errorf("failed to stat sstable file: %v", err)
 	}
 
@@ -969,41 +1192,55 @@ func (e *LSMEnergy) flushImmutableToSSTable(imm *ImmutableMemTable) error {
 	fm := &FileMetadata{
 		FileNum:     sstableNum,
 		Size:        info.Size(),
-		SmallestKey: nil, // TODO: 从 builder 获取
-		LargestKey:  nil, // TODO: 从 builder 获取
-		Level:       0,   // Level 0
+		SmallestKey: builder.SmallestKey(),
+		LargestKey:  builder.LargestKey(),
+		Level:       0, // Level 0
 	}
 
 	// 添加到版本集合
 	err = e.versionSet.LogAddFile(fm)
 	if err != nil {
 		reader.Close()
+		e.flushErrors.Add(1)
 		return fmt.Errorf("failed to log add file: %v", err)
 	}
 
 	if e.offloader != nil {
 		if err := e.offloader.OffloadIfNeeded(fm); err != nil {
 			reader.Close()
+			e.flushErrors.Add(1)
 			return fmt.Errorf("failed to offload sstable: %v", err)
 		}
 	}
 
 	// 添加到缓存
 	e.tableCache.Add(sstableNum, reader)
-	fmt.Printf("[SSTABLE] Added to table cache\n")
+	logger.Debug("SSTable added to table cache")
+
+	e.flushCount.Add(1)
+	e.flushBytesWritten.Add(uint64(info.Size()))
+	e.flushDurationNanos.Add(uint64(time.Since(start).Nanoseconds()))
 
 	return nil
 }
 
 // Close 关闭 LSM 引擎
 func (e *LSMEnergy) Close() error {
+	e.mu.Lock()
+	if e.closed.Load() {
+		e.mu.Unlock()
+		return nil
+	}
+	e.closed.Store(true)
+	e.mu.Unlock()
+
 	e.closeOnce.Do(func() {
-		e.closed.Store(true)
 		close(e.gcStop)
 		close(e.bgStop)
 	})
 
 	e.bgWG.Wait()
+	e.flushWG.Wait()
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -1044,7 +1281,11 @@ func (e *LSMEnergy) Close() error {
 	}
 
 	// 4. 关闭所有 SSTable
-	e.tableCache.Close()
+	if e.tableCache != nil {
+		if err := e.tableCache.Close(); err != nil {
+			logger.Warn("Failed to close table cache: %v", err)
+		}
+	}
 	logger.Info("Closed table cache")
 
 	// 5. 关闭版本集合
@@ -1058,14 +1299,18 @@ func (e *LSMEnergy) Close() error {
 
 	// 4. 关闭 Value Log
 	if e.vLogReader != nil {
-		e.vLogReader.Close()
+		if err := e.vLogReader.Close(); err != nil {
+			logger.Warn("Failed to close value log reader: %v", err)
+		}
 	}
 	if e.vLogWriter != nil {
-		e.vLogWriter.Close()
+		if err := e.vLogWriter.Close(); err != nil {
+			logger.Warn("Failed to close value log writer: %v", err)
+		}
 	}
 	logger.Info("Value Log closed")
 
-	fmt.Println("LSM Engine closed successfully")
+	logger.Info("LSM Engine closed successfully")
 	return nil
 }
 
@@ -1090,6 +1335,10 @@ func (e *LSMEnergy) GetStats() map[string]interface{} {
 
 	stats["writes_per_sec"] = e.writeOpsPerSec.Load()
 	stats["cache_hit_permille"] = e.cacheHitPermille.Load()
+	stats["flush_count"] = e.flushCount.Load()
+	stats["flush_bytes_written"] = e.flushBytesWritten.Load()
+	stats["flush_duration_ms"] = float64(e.flushDurationNanos.Load()) / 1e6
+	stats["flush_errors"] = e.flushErrors.Load()
 
 	if e.options != nil {
 		stats["value_threshold"] = e.options.ValueThreshold
@@ -1103,14 +1352,32 @@ func (e *LSMEnergy) GetStats() map[string]interface{} {
 		stats["write_ahead_log"] = e.options.WriteAheadLog
 	}
 
+	if e.wal != nil {
+		stats["wal"] = e.wal.Stats()
+	}
+	if e.vLogWriter != nil {
+		stats["vlog"] = e.vLogWriter.Stats()
+	}
+
 	if e.versionSet != nil {
 		stats["version_set"] = e.versionSet.GetStats()
+	}
+	if e.compactor != nil {
+		cs := e.compactor.GetStats()
+		stats["compaction"] = map[string]interface{}{
+			"num_compactions":  cs.NumCompactions,
+			"num_files_merged": cs.NumFilesMerged,
+			"bytes_read":       cs.BytesRead,
+			"bytes_written":    cs.BytesWritten,
+			"duration_ms":      cs.DurationMs,
+		}
 	}
 
 	tableStats := map[string]interface{}{}
 	if e.tableCache != nil {
 		tableStats["len"] = e.tableCache.Len()
 		tableStats["capacity"] = e.tableCache.Capacity()
+		tableStats["bloom"] = e.tableCache.BloomStats()
 	} else {
 		tableStats["len"] = 0
 		tableStats["capacity"] = 0
@@ -1128,6 +1395,7 @@ func (e *LSMEnergy) GetStats() map[string]interface{} {
 		blockStats["size_bytes"] = e.blockCache.Size()
 		blockStats["max_size_bytes"] = e.blockCache.MaxSize()
 		blockStats["items"] = e.blockCache.Len()
+		blockStats["segments"] = e.blockCache.SegmentStats()
 	} else {
 		blockStats["enabled"] = false
 	}
@@ -1155,7 +1423,7 @@ func (e *LSMEnergy) LoadAllKeys() (map[string][]byte, error) {
 	result := make(map[string][]byte)
 	deletedKeys := make(map[string]struct{}) // 记录已删除的 key
 
-	fmt.Printf("[LoadAllKeys] Starting to load keys...\n")
+	logger.Info("LoadAllKeys starting")
 
 	// 辅助函数：处理单个 key-value
 	processEntry := func(source string, key, valPtrBytes []byte) {
@@ -1275,6 +1543,6 @@ func (e *LSMEnergy) LoadAllKeys() (map[string][]byte, error) {
 		}
 	}
 
-	fmt.Printf("[LoadAllKeys] Loaded total %d keys, ignored %d deleted keys\n", len(result), len(deletedKeys))
+	logger.Info("LoadAllKeys loaded total %d keys, ignored %d deleted keys", len(result), len(deletedKeys))
 	return result, nil
 }

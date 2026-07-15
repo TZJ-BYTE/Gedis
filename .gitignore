@@ -63,3 +63,7 @@ coverage.html
 # Bench artifacts
 bench-results/
 docs/performance_benchmark_report.md
+
+# Rust build output
+target/
+engine_v2/target/

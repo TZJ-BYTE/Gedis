@@ -15,9 +15,9 @@ import (
 // ValueLogGC 垃圾回收器
 type ValueLogGC struct {
 	dirPath      string
-	gcThreshold  float64                                          // 垃圾回收阈值 (例如 0.5 表示 50% 空间无效时回收)
-	checkKeyFunc func(key []byte, vp *ValuePointer) (bool, error) // 回调函数：检查 Key 指向的 VP 是否依然有效
-	rewriteFunc  func(key, value []byte) error                    // 回调函数：重写有效数据
+	gcThreshold  float64                                            // 垃圾回收阈值 (例如 0.5 表示 50% 空间无效时回收)
+	checkKeyFunc func(key []byte, vp *ValuePointer) (bool, error)   // 回调函数：检查 Key 指向的 VP 是否依然有效
+	rewriteFunc  func(key, value []byte, oldVP *ValuePointer) error // 回调函数：重写有效数据
 
 	mu       sync.Mutex
 	progress gcProgress
@@ -37,7 +37,7 @@ const (
 )
 
 // NewValueLogGC 创建 GC
-func NewValueLogGC(dirPath string, threshold float64, checkFunc func([]byte, *ValuePointer) (bool, error), rewriteFunc func([]byte, []byte) error) *ValueLogGC {
+func NewValueLogGC(dirPath string, threshold float64, checkFunc func([]byte, *ValuePointer) (bool, error), rewriteFunc func([]byte, []byte, *ValuePointer) error) *ValueLogGC {
 	return &ValueLogGC{
 		dirPath:      dirPath,
 		gcThreshold:  threshold,
@@ -282,7 +282,7 @@ func (gc *ValueLogGC) rewriteFileWithBudget(p *gcProgress, maxBytes int64, maxDu
 			if err != nil {
 				return err
 			}
-			if err := gc.rewriteFunc(key, value); err != nil {
+			if err := gc.rewriteFunc(key, value, vp); err != nil {
 				return fmt.Errorf("failed to rewrite entry during GC: %v", err)
 			}
 		}

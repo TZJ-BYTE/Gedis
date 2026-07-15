@@ -7,6 +7,7 @@ import (
 	"io"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -49,6 +50,28 @@ var responsePool = sync.Pool{
 	New: func() interface{} {
 		return &Response{}
 	},
+}
+
+var parseMaxBulkLen atomic.Int64
+var parseMaxArrayLen atomic.Int64
+
+func SetParseLimits(maxBulkLen, maxArrayLen int) {
+	if maxBulkLen < 0 {
+		maxBulkLen = 0
+	}
+	if maxArrayLen < 0 {
+		maxArrayLen = 0
+	}
+	parseMaxBulkLen.Store(int64(maxBulkLen))
+	parseMaxArrayLen.Store(int64(maxArrayLen))
+}
+
+func getParseMaxBulkLen() int {
+	return int(parseMaxBulkLen.Load())
+}
+
+func getParseMaxArrayLen() int {
+	return int(parseMaxArrayLen.Load())
 }
 
 func acquireResponse() *Response {
@@ -181,6 +204,12 @@ func (p *Parser) ParseRequest() (*Request, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid array length")
 	}
+	if count < 0 {
+		return nil, fmt.Errorf("invalid array length")
+	}
+	if maxArrayLen := getParseMaxArrayLen(); maxArrayLen > 0 && count > maxArrayLen {
+		return nil, fmt.Errorf("invalid array length")
+	}
 
 	if count == 0 {
 		return nil, fmt.Errorf("empty array")
@@ -243,6 +272,12 @@ func (p *Parser) readBulkString() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("invalid bulk string length")
 	}
+	if length < -1 {
+		return "", fmt.Errorf("invalid bulk string length")
+	}
+	if maxBulkLen := getParseMaxBulkLen(); maxBulkLen > 0 && length > maxBulkLen {
+		return "", fmt.Errorf("invalid bulk string length")
+	}
 
 	// -1 表示空值
 	if length == -1 {
@@ -294,6 +329,12 @@ func ParseOneRequest(data []byte) (*Request, int, error) {
 	if err != nil {
 		return nil, 0, fmt.Errorf("invalid array length")
 	}
+	if count < 0 {
+		return nil, 0, fmt.Errorf("invalid array length")
+	}
+	if maxArrayLen := getParseMaxArrayLen(); maxArrayLen > 0 && count > maxArrayLen {
+		return nil, 0, fmt.Errorf("invalid array length")
+	}
 
 	if count == 0 {
 		return nil, 0, fmt.Errorf("empty array")
@@ -327,6 +368,12 @@ func ParseOneRequest(data []byte) (*Request, int, error) {
 
 		length, err := strconv.Atoi(string(line))
 		if err != nil {
+			return nil, 0, fmt.Errorf("invalid bulk string length")
+		}
+		if length < -1 {
+			return nil, 0, fmt.Errorf("invalid bulk string length")
+		}
+		if maxBulkLen := getParseMaxBulkLen(); maxBulkLen > 0 && length > maxBulkLen {
 			return nil, 0, fmt.Errorf("invalid bulk string length")
 		}
 
@@ -384,6 +431,12 @@ func ParseOneRequestFast(data []byte) (*Request, int, error) {
 	if err != nil {
 		return nil, 0, fmt.Errorf("invalid array length")
 	}
+	if count < 0 {
+		return nil, 0, fmt.Errorf("invalid array length")
+	}
+	if maxArrayLen := getParseMaxArrayLen(); maxArrayLen > 0 && count > maxArrayLen {
+		return nil, 0, fmt.Errorf("invalid array length")
+	}
 	if count == 0 {
 		return nil, 0, fmt.Errorf("empty array")
 	}
@@ -418,6 +471,14 @@ func ParseOneRequestFast(data []byte) (*Request, int, error) {
 		}
 		length, err := parseIntBytes(line)
 		if err != nil {
+			ReleaseRequest(req)
+			return nil, 0, fmt.Errorf("invalid bulk string length")
+		}
+		if length < -1 {
+			ReleaseRequest(req)
+			return nil, 0, fmt.Errorf("invalid bulk string length")
+		}
+		if maxBulkLen := getParseMaxBulkLen(); maxBulkLen > 0 && length > maxBulkLen {
 			ReleaseRequest(req)
 			return nil, 0, fmt.Errorf("invalid bulk string length")
 		}
@@ -521,14 +582,48 @@ func appendResponse(dst *[]byte, resp *Response) {
 		}
 		appendCRLF(dst)
 	case BulkString:
-		appendBulkString(dst, resp.Value.(string))
+		if resp.Value == nil {
+			*dst = append(*dst, BulkString)
+			*dst = append(*dst, '-', '1')
+			appendCRLF(dst)
+			return
+		}
+		switch v := resp.Value.(type) {
+		case string:
+			appendBulkString(dst, v)
+		case []byte:
+			*dst = append(*dst, BulkString)
+			appendInt(dst, int64(len(v)))
+			appendCRLF(dst)
+			*dst = append(*dst, v...)
+			appendCRLF(dst)
+		default:
+			appendBulkString(dst, fmt.Sprintf("%v", resp.Value))
+		}
 	case Array:
 		*dst = append(*dst, Array)
-		arr := resp.Value.([]string)
-		appendInt(dst, int64(len(arr)))
-		appendCRLF(dst)
-		for _, item := range arr {
-			appendBulkString(dst, item)
+		switch arr := resp.Value.(type) {
+		case []string:
+			appendInt(dst, int64(len(arr)))
+			appendCRLF(dst)
+			for _, item := range arr {
+				appendBulkString(dst, item)
+			}
+		case []*Response:
+			appendInt(dst, int64(len(arr)))
+			appendCRLF(dst)
+			for _, item := range arr {
+				if item == nil {
+					*dst = append(*dst, BulkString)
+					*dst = append(*dst, '-', '1')
+					appendCRLF(dst)
+					continue
+				}
+				appendResponse(dst, item)
+			}
+		default:
+			appendInt(dst, 0)
+			appendCRLF(dst)
 		}
 	}
 }
@@ -573,10 +668,17 @@ func MakeArray(items []string) *Response {
 	return resp
 }
 
+func MakeArrayResponses(items []*Response) *Response {
+	resp := acquireResponse()
+	resp.Type = Array
+	resp.Value = items
+	return resp
+}
+
 // MakeNull 创建空响应
 func MakeNull() *Response {
 	resp := acquireResponse()
 	resp.Type = BulkString
-	resp.Value = ""
+	resp.Value = nil
 	return resp
 }

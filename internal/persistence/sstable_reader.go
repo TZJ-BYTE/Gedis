@@ -4,19 +4,28 @@ import (
 	"bytes"
 	"encoding/binary"
 	"os"
+	"sync"
+	"sync/atomic"
 )
 
 // SSTableReader SSTable 读取器
 type SSTableReader struct {
-	file        *os.File // 文件句柄
-	filename    string   // 文件名
-	fileNum     uint64
-	options     *Options          // 配置选项
-	footer      *Footer           // Footer 信息
-	indexBlock  *Block            // Index Block（常驻内存）
-	dataCache   map[uint64]*Block // Data Block 缓存（简化版）
-	bloomFilter *BloomFilter      // Bloom Filter（可选）
-	blockCache  *BlockCache       // Block Cache（LRU）
+	file           *os.File // 文件句柄
+	filename       string   // 文件名
+	fileNum        uint64
+	options        *Options          // 配置选项
+	footer         *Footer           // Footer 信息
+	indexBlock     *Block            // Index Block（常驻内存）
+	dataCache      map[uint64]*Block // Data Block 缓存（简化版）
+	bloomFilter    *BloomFilter      // Bloom Filter（可选）
+	blockCache     *BlockCache       // Block Cache（LRU）
+	bloomChecks    atomic.Uint64
+	bloomNegatives atomic.Uint64
+	refCount       atomic.Int64
+	closed         atomic.Bool
+	closeOnce      sync.Once
+	closeMu        sync.Mutex
+	closeErr       error
 }
 
 // OpenSSTableForRead 打开 SSTable 用于读取
@@ -29,7 +38,7 @@ func OpenSSTableForReadWithCache(fileNum uint64, filename string, options *Optio
 		options = DefaultOptions()
 	}
 
-	file, err := os.OpenFile(filename, os.O_RDONLY, 0644)
+	file, err := os.Open(filename)
 	if err != nil {
 		return nil, err
 	}
@@ -51,6 +60,7 @@ func OpenSSTableForReadWithCache(fileNum uint64, filename string, options *Optio
 		dataCache:  make(map[uint64]*Block),
 		blockCache: cache,
 	}
+	reader.refCount.Store(1)
 
 	// 读取 Footer
 	if err := reader.readFooter(); err != nil {
@@ -81,8 +91,49 @@ func NewSSTableReader(filename string, file *os.File, options *Options) (*SSTabl
 		dataCache:  make(map[uint64]*Block),
 		blockCache: nil,
 	}
+	r.refCount.Store(1)
 
 	return r, nil
+}
+
+func (r *SSTableReader) retain() bool {
+	for {
+		if r.closed.Load() {
+			return false
+		}
+		cur := r.refCount.Load()
+		if cur == 0 {
+			return false
+		}
+		if r.refCount.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
+func (r *SSTableReader) release() {
+	for {
+		cur := r.refCount.Load()
+		if cur == 0 {
+			return
+		}
+		if r.refCount.CompareAndSwap(cur, cur-1) {
+			if cur-1 == 0 {
+				r.closeOnce.Do(func() {
+					var err error
+					if r.file != nil {
+						err = r.file.Close()
+						r.file = nil
+					}
+					r.closed.Store(true)
+					r.closeMu.Lock()
+					r.closeErr = err
+					r.closeMu.Unlock()
+				})
+			}
+			return
+		}
+	}
 }
 
 // readFooter 读取文件 Footer
@@ -169,9 +220,20 @@ func (r *SSTableReader) loadIndexBlock() error {
 
 // Get 获取指定 key 的值
 func (r *SSTableReader) Get(key []byte) ([]byte, bool) {
+	if !r.retain() {
+		return nil, false
+	}
+	defer r.release()
+	if r.file == nil {
+		return nil, false
+	}
 	// 1. 先检查 Bloom Filter（如果有）
-	if r.bloomFilter != nil && !r.bloomFilter.MayContain(key) {
-		return nil, false // 肯定不存在
+	if r.bloomFilter != nil {
+		r.bloomChecks.Add(1)
+		if !r.bloomFilter.MayContain(key) {
+			r.bloomNegatives.Add(1)
+			return nil, false
+		}
 	}
 
 	// 2. 在 Index Block 中找到目标 Data Block
@@ -208,6 +270,10 @@ func (r *SSTableReader) Get(key []byte) ([]byte, bool) {
 	}
 
 	return nil, false
+}
+
+func (r *SSTableReader) BloomStats() (checks uint64, negatives uint64) {
+	return r.bloomChecks.Load(), r.bloomNegatives.Load()
 }
 
 // findDataBlock 在 Index Block 中查找目标 Data Block
@@ -284,9 +350,11 @@ func (r *SSTableReader) getFromBlock(handle BlockHandle, key []byte) ([]byte, bo
 
 // NewIterator 创建 SSTable 迭代器
 func (r *SSTableReader) NewIterator() *SSTableIterator {
+	retained := r.retain()
 	return &SSTableIterator{
-		reader: r,
-		valid:  false,
+		reader:   r,
+		valid:    false,
+		retained: retained,
 	}
 }
 
@@ -317,20 +385,18 @@ func (r *SSTableReader) loadMetaBlock() error {
 
 // Close 关闭 SSTable Reader
 func (r *SSTableReader) Close() error {
-	if r.file != nil {
-		return r.file.Close()
-	}
-	return nil
+	r.release()
+	r.closeMu.Lock()
+	defer r.closeMu.Unlock()
+	return r.closeErr
 }
 
 // getBlockFromCache 从缓存中获取 Block
 func (r *SSTableReader) getBlockFromCache(offset uint64) (*Block, bool) {
 	// 先尝试 LRU Cache
 	if r.blockCache != nil {
-		if val, ok := r.blockCache.Get(r.blockCacheKey(offset)); ok {
-			if block, ok := val.(*Block); ok {
-				return block, true
-			}
+		if block, ok := r.blockCache.Get(r.blockCacheKey(offset)); ok {
+			return block, true
 		}
 	}
 
@@ -366,6 +432,7 @@ type SSTableIterator struct {
 	current   *BlockIterator
 	valid     bool
 	err       error
+	retained  bool
 }
 
 // SeekToFirst 定位到第一个元素
@@ -375,6 +442,11 @@ func (it *SSTableIterator) SeekToFirst() {
 
 // First 定位到第一个元素
 func (it *SSTableIterator) First() bool {
+	if it.reader == nil || !it.retained {
+		it.valid = false
+		it.err = ErrInvalidFormat
+		return false
+	}
 	if it.reader.indexBlock == nil {
 		it.valid = false
 		return false
@@ -395,6 +467,11 @@ func (it *SSTableIterator) First() bool {
 
 // Seek 定位到第一个 >= key 的元素
 func (it *SSTableIterator) Seek(key []byte) bool {
+	if it.reader == nil || !it.retained {
+		it.valid = false
+		it.err = ErrInvalidFormat
+		return false
+	}
 	if it.reader.indexBlock == nil {
 		it.valid = false
 		return false
@@ -589,4 +666,8 @@ func (it *SSTableIterator) Release() {
 	}
 	it.current = nil
 	it.valid = false
+	if it.retained && it.reader != nil {
+		it.reader.release()
+	}
+	it.retained = false
 }

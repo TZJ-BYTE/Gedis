@@ -54,6 +54,7 @@ func InitDefaultCommands() {
 	DefaultRegistry.Register("EXPIRE", &ExpireCommand{})
 	DefaultRegistry.Register("KEYS", &KeysCommand{})
 	DefaultRegistry.Register("FLUSHDB", &FlushDBCommand{})
+	DefaultRegistry.Register("FLUSHALL", &FlushAllCommand{})
 	DefaultRegistry.Register("DBSIZE", &DBSizeCommand{})
 
 	// 连接测试命令

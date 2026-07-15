@@ -14,6 +14,11 @@ type InfoCommand struct{}
 
 func (c *InfoCommand) Execute(db *database.Database, args [][]byte) *protocol.Response {
 	stats := db.GetStats()
+	mgr := getDBManager()
+	var mgrStats map[string]interface{}
+	if mgr != nil {
+		mgrStats = mgr.GetStats()
+	}
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 
@@ -30,6 +35,25 @@ func (c *InfoCommand) Execute(db *database.Database, args [][]byte) *protocol.Re
 	writeKV(&b, "used_memory_bytes", fmt.Sprintf("%v", stats["used_memory_bytes"]))
 	writeKV(&b, "max_memory_bytes", fmt.Sprintf("%v", stats["max_memory_bytes"]))
 	writeKV(&b, "max_memory_policy", fmt.Sprintf("%v", stats["max_memory_policy"]))
+
+	if mgrStats != nil {
+		writeSection(&b, "db_manager")
+		writeKV(&b, "db_count", fmt.Sprintf("%v", mgrStats["db_count"]))
+		writeKV(&b, "persistence_enabled", fmt.Sprintf("%v", mgrStats["persistence_enabled"]))
+		if v, ok := mgrStats["data_dir"]; ok {
+			writeKV(&b, "data_dir", fmt.Sprintf("%v", v))
+		}
+		if dbs, ok := mgrStats["databases"].([]map[string]interface{}); ok {
+			writeSection(&b, "databases")
+			for _, s := range dbs {
+				id, _ := s["db_id"]
+				prefix := fmt.Sprintf("db_%v_", id)
+				writeKV(&b, prefix+"mode", fmt.Sprintf("%v", s["mode"]))
+				writeKV(&b, prefix+"memory_keys", fmt.Sprintf("%v", s["memory_keys"]))
+				writeKV(&b, prefix+"used_memory_bytes", fmt.Sprintf("%v", s["used_memory_bytes"]))
+			}
+		}
+	}
 
 	writeSection(&b, "runtime")
 	writeKV(&b, "heap_alloc_bytes", fmt.Sprintf("%d", ms.HeapAlloc))

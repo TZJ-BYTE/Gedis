@@ -1,8 +1,10 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
+	"strings"
 )
 
 // ColdStartStrategy 冷启动数据加载策略
@@ -23,6 +25,9 @@ type Config struct {
 	Port        int    `yaml:"port" json:"port"`
 	NetworkType string `yaml:"network_type" json:"network_type"` // "std", "gnet"
 
+	RespMaxBulkLen  int `yaml:"resp_max_bulk_len" json:"resp_max_bulk_len"`
+	RespMaxArrayLen int `yaml:"resp_max_array_len" json:"resp_max_array_len"`
+
 	// 数据库配置
 	DBCount int `yaml:"db_count" json:"db_count"`
 
@@ -39,6 +44,9 @@ type Config struct {
 	AOFPath            string `yaml:"aof_path" json:"aof_path"`
 	RDBPath            string `yaml:"rdb_path" json:"rdb_path"`
 
+	PersistenceWriteMode  string `yaml:"persistence_write_mode" json:"persistence_write_mode"` // "strong", "weak"
+	PersistenceDurability string `yaml:"persistence_durability" json:"persistence_durability"` // "wal", "wal_fsync", "lsm"
+
 	// LSM 配置
 	BlockSize       int   `yaml:"block_size" json:"block_size"`       // SSTable block 大小
 	MemTableSize    int   `yaml:"memtable_size" json:"memtable_size"` // MemTable 最大大小
@@ -49,6 +57,9 @@ type Config struct {
 	// 日志配置
 	LogLevel string `yaml:"log_level" json:"log_level"`
 	LogPath  string `yaml:"log_path" json:"log_path"`
+
+	PprofEnabled bool   `yaml:"pprof_enabled" json:"pprof_enabled"`
+	PprofAddr    string `yaml:"pprof_addr" json:"pprof_addr"`
 
 	// 存算分离配置
 	OffloadEnabled    bool   `yaml:"offload_enabled" json:"offload_enabled"`
@@ -92,6 +103,22 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v, ok := os.LookupEnv("REDIGO_DATA_DIR"); ok && v != "" {
 		c.DataDir = v
+	}
+	if v, ok := os.LookupEnv("REDIGO_RESP_MAX_BULK_LEN"); ok && v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.RespMaxBulkLen = n
+		}
+	}
+	if v, ok := os.LookupEnv("REDIGO_RESP_MAX_ARRAY_LEN"); ok && v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.RespMaxArrayLen = n
+		}
+	}
+	if v, ok := os.LookupEnv("REDIGO_PERSISTENCE_WRITE_MODE"); ok && v != "" {
+		c.PersistenceWriteMode = v
+	}
+	if v, ok := os.LookupEnv("REDIGO_PERSISTENCE_DURABILITY"); ok && v != "" {
+		c.PersistenceDurability = v
 	}
 	if v, ok := os.LookupEnv("REDIGO_OFFLOAD_ENABLED"); ok {
 		if b, err := strconv.ParseBool(v); err == nil {
@@ -137,6 +164,14 @@ func (c *Config) applyEnvOverrides() {
 	if v, ok := os.LookupEnv("REDIGO_OFFLOAD_FS_ROOT"); ok && v != "" {
 		c.OffloadFSRoot = v
 	}
+	if v, ok := os.LookupEnv("REDIGO_PPROF_ENABLED"); ok {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.PprofEnabled = b
+		}
+	}
+	if v, ok := os.LookupEnv("REDIGO_PPROF_ADDR"); ok && v != "" {
+		c.PprofAddr = v
+	}
 }
 
 // GetColdStartStrategy 解析冷启动策略
@@ -149,4 +184,27 @@ func (c *Config) GetColdStartStrategy() ColdStartStrategy {
 	default:
 		return NoLoad
 	}
+}
+
+func (c *Config) Validate() error {
+	if strings.TrimSpace(c.Host) == "" {
+		return fmt.Errorf("invalid host")
+	}
+	if c.Port <= 0 || c.Port > 65535 {
+		return fmt.Errorf("invalid port")
+	}
+	if c.OffloadEnabled && strings.EqualFold(strings.TrimSpace(c.OffloadBackend), "minio") {
+		ak := strings.TrimSpace(c.OffloadAccessKey)
+		sk := strings.TrimSpace(c.OffloadSecretKey)
+		if ak == "" || sk == "" {
+			return fmt.Errorf("invalid offload credentials")
+		}
+		if ak == "minioadmin" || sk == "minioadmin" {
+			return fmt.Errorf("invalid offload credentials")
+		}
+		if strings.TrimSpace(c.OffloadEndpoint) == "" || strings.TrimSpace(c.OffloadBucket) == "" {
+			return fmt.Errorf("invalid offload config")
+		}
+	}
+	return nil
 }

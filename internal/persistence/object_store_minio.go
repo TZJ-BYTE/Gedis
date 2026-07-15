@@ -61,3 +61,15 @@ func (s *MinioObjectStore) StatObject(key string) (bool, error) {
 	}
 	return false, err
 }
+
+func (s *MinioObjectStore) DeleteObject(key string) error {
+	err := s.client.RemoveObject(context.Background(), s.bucket, s.prefix+key, minio.RemoveObjectOptions{})
+	if err == nil {
+		return nil
+	}
+	resp := minio.ToErrorResponse(err)
+	if resp.StatusCode == 404 {
+		return nil
+	}
+	return err
+}

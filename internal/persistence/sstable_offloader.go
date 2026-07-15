@@ -1,10 +1,16 @@
 package persistence
 
 import (
+	"bytes"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+
+	"golang.org/x/sync/singleflight"
 )
 
 type SSTableOffloader struct {
@@ -14,6 +20,7 @@ type SSTableOffloader struct {
 
 	sstableDir string
 	store      ObjectStore
+	sf         singleflight.Group
 }
 
 func NewSSTableOffloader(options *Options, sstableDir string) (*SSTableOffloader, error) {
@@ -41,9 +48,9 @@ func NewSSTableOffloader(options *Options, sstableDir string) (*SSTableOffloader
 	}
 
 	return &SSTableOffloader{
-		enabled:   true,
-		minLevel:  minLevel,
-		keepLocal: options.OffloadKeepLocal,
+		enabled:    true,
+		minLevel:   minLevel,
+		keepLocal:  options.OffloadKeepLocal,
 		sstableDir: sstableDir,
 		store:      store,
 	}, nil
@@ -51,6 +58,27 @@ func NewSSTableOffloader(options *Options, sstableDir string) (*SSTableOffloader
 
 func (o *SSTableOffloader) keyFor(fileNum uint64) string {
 	return fmt.Sprintf("sstable/%06d.sstable", fileNum)
+}
+
+func (o *SSTableOffloader) checksumKeyFor(fileNum uint64) string {
+	return o.keyFor(fileNum) + ".crc32"
+}
+
+func (o *SSTableOffloader) DeleteRemote(fileNum uint64) error {
+	if !o.enabled || o.store == nil {
+		return nil
+	}
+	key := strconv.FormatUint(fileNum, 10)
+	_, err, _ := o.sf.Do("del:"+key, func() (interface{}, error) {
+		if err := o.store.DeleteObject(o.keyFor(fileNum)); err != nil {
+			return nil, err
+		}
+		if err := o.store.DeleteObject(o.checksumKeyFor(fileNum)); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	})
+	return err
 }
 
 func (o *SSTableOffloader) localPath(fileNum uint64) string {
@@ -65,7 +93,15 @@ func (o *SSTableOffloader) OffloadIfNeeded(fm *FileMetadata) error {
 		return nil
 	}
 
-	local := o.localPath(fm.FileNum)
+	key := strconv.FormatUint(fm.FileNum, 10)
+	_, err, _ := o.sf.Do("put:"+key, func() (interface{}, error) {
+		return nil, o.offloadOne(fm.FileNum)
+	})
+	return err
+}
+
+func (o *SSTableOffloader) offloadOne(fileNum uint64) error {
+	local := o.localPath(fileNum)
 	f, err := os.Open(local)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -75,7 +111,12 @@ func (o *SSTableOffloader) OffloadIfNeeded(fm *FileMetadata) error {
 	}
 	defer f.Close()
 
-	if err := o.store.PutObject(o.keyFor(fm.FileNum), f); err != nil {
+	h := crc32.NewIEEE()
+	if err := o.store.PutObject(o.keyFor(fileNum), io.TeeReader(f, h)); err != nil {
+		return err
+	}
+	sum := h.Sum32()
+	if err := o.store.PutObject(o.checksumKeyFor(fileNum), bytes.NewReader([]byte(fmt.Sprintf("%08x", sum)))); err != nil {
 		return err
 	}
 
@@ -95,6 +136,25 @@ func (o *SSTableOffloader) EnsureLocal(fileNum uint64) error {
 		return nil
 	}
 
+	key := strconv.FormatUint(fileNum, 10)
+	_, err, _ := o.sf.Do("get:"+key, func() (interface{}, error) {
+		return nil, o.ensureLocalOne(fileNum)
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(local); err == nil {
+		return nil
+	}
+	return os.ErrNotExist
+}
+
+func (o *SSTableOffloader) ensureLocalOne(fileNum uint64) error {
+	local := o.localPath(fileNum)
+	if _, err := os.Stat(local); err == nil {
+		return nil
+	}
+
 	ok, err := o.store.StatObject(o.keyFor(fileNum))
 	if err != nil {
 		return err
@@ -103,22 +163,28 @@ func (o *SSTableOffloader) EnsureLocal(fileNum uint64) error {
 		return os.ErrNotExist
 	}
 
+	expected, hasExpected, err := o.getRemoteChecksum(fileNum)
+	if err != nil {
+		return err
+	}
+
 	rc, err := o.store.GetObject(o.keyFor(fileNum))
 	if err != nil {
 		return err
 	}
 	defer rc.Close()
 
-	if err := os.MkdirAll(filepath.Dir(local), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(local), 0750); err != nil {
 		return err
 	}
 
-	tmp := local + ".download"
-	f, err := os.Create(tmp)
+	f, err := os.CreateTemp(filepath.Dir(local), filepath.Base(local)+".download-*")
 	if err != nil {
 		return err
 	}
-	_, copyErr := io.Copy(f, rc)
+	tmp := f.Name()
+	h := crc32.NewIEEE()
+	_, copyErr := io.Copy(io.MultiWriter(f, h), rc)
 	closeErr := f.Close()
 	if copyErr != nil {
 		_ = os.Remove(tmp)
@@ -129,6 +195,35 @@ func (o *SSTableOffloader) EnsureLocal(fileNum uint64) error {
 		return closeErr
 	}
 
+	if hasExpected && h.Sum32() != expected {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("sstable checksum mismatch")
+	}
+
 	return os.Rename(tmp, local)
 }
 
+func (o *SSTableOffloader) getRemoteChecksum(fileNum uint64) (uint32, bool, error) {
+	ok, err := o.store.StatObject(o.checksumKeyFor(fileNum))
+	if err != nil {
+		return 0, false, err
+	}
+	if !ok {
+		return 0, false, nil
+	}
+	rc, err := o.store.GetObject(o.checksumKeyFor(fileNum))
+	if err != nil {
+		return 0, false, err
+	}
+	defer rc.Close()
+	b, err := io.ReadAll(rc)
+	if err != nil {
+		return 0, false, err
+	}
+	s := strings.TrimSpace(string(b))
+	u, err := strconv.ParseUint(s, 16, 32)
+	if err != nil {
+		return 0, false, err
+	}
+	return uint32(u), true, nil
+}

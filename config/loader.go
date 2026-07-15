@@ -9,17 +9,21 @@ import (
 
 func defaultConfigNoEnv() *Config {
 	return &Config{
-		Host:            "0.0.0.0",
+		Host:            "127.0.0.1",
 		Port:            16379,
 		NetworkType:     "std",
+		RespMaxBulkLen:  64 << 20,
+		RespMaxArrayLen: 1 << 20,
 		DBCount:         16,
 		MaxMemory:       256 * 1024 * 1024,
 		MaxMemoryPolicy: "noeviction",
 
-		PersistenceEnabled: true,
-		PersistenceType:    "lsm",
-		DataDir:            "./data",
-		ColdStartStrategy:  "load_all",
+		PersistenceEnabled:    false,
+		PersistenceType:       "rust",
+		DataDir:               "./data",
+		ColdStartStrategy:     "lazy_load",
+		PersistenceWriteMode:  "strong",
+		PersistenceDurability: "wal_fsync",
 
 		AOFEnabled: false,
 		AOFPath:    "./data/appendonly.aof",
@@ -34,11 +38,14 @@ func defaultConfigNoEnv() *Config {
 		LogLevel: "info",
 		LogPath:  "./logs/redigo.log",
 
+		PprofEnabled: false,
+		PprofAddr:    "127.0.0.1:6060",
+
 		OffloadEnabled:    false,
 		OffloadBackend:    "fs",
 		OffloadEndpoint:   "127.0.0.1:9000",
-		OffloadAccessKey:  "minioadmin",
-		OffloadSecretKey:  "minioadmin",
+		OffloadAccessKey:  "",
+		OffloadSecretKey:  "",
 		OffloadBucket:     "redigo-data",
 		OffloadUseSSL:     false,
 		OffloadRegion:     "us-east-1",
@@ -59,6 +66,8 @@ func LoadFromFile(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config file: %w", err)
 	}
 	cfg.applyEnvOverrides()
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
 	return cfg, nil
 }
-

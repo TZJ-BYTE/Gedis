@@ -7,7 +7,7 @@ import (
 
 type CacheItem struct {
 	key    uint64
-	value  interface{}
+	value  *Block
 	size   int
 	seg    uint8
 	hits   uint32
@@ -15,19 +15,21 @@ type CacheItem struct {
 }
 
 type BlockCache struct {
-	mu         sync.RWMutex
-	cache      map[uint64]*list.Element // offset -> list element
-	probation  *list.List
-	protected  *list.List
-	maxSize    int64 // 最大缓存大小（字节）
-	curSize    int64
-	probSize   int64
-	protSize   int64
-	protMax    int64
-	pinMinHits uint32
-	hits       int64 // 命中次数
-	misses     int64 // 未命中次数
-	evictions  int64 // 淘汰次数
+	mu          sync.RWMutex
+	cache       map[uint64]*list.Element // offset -> list element
+	probation   *list.List
+	protected   *list.List
+	maxSize     int64 // 最大缓存大小（字节）
+	curSize     int64
+	probSize    int64
+	protSize    int64
+	protMax     int64
+	pinMinHits  uint32
+	pinMaxItems int
+	pinnedCount int
+	hits        int64 // 命中次数
+	misses      int64 // 未命中次数
+	evictions   int64 // 淘汰次数
 }
 
 func NewBlockCache(maxSize int64) *BlockCache {
@@ -46,16 +48,17 @@ func NewBlockCacheWithPolicy(maxSize int64, protectedRatio float64, pinMinHits u
 		protMax = 0
 	}
 	return &BlockCache{
-		cache:      make(map[uint64]*list.Element),
-		probation:  list.New(),
-		protected:  list.New(),
-		maxSize:    maxSize,
-		protMax:    protMax,
-		pinMinHits: pinMinHits,
+		cache:       make(map[uint64]*list.Element),
+		probation:   list.New(),
+		protected:   list.New(),
+		maxSize:     maxSize,
+		protMax:     protMax,
+		pinMinHits:  pinMinHits,
+		pinMaxItems: 4096,
 	}
 }
 
-func (c *BlockCache) Get(key uint64) (interface{}, bool) {
+func (c *BlockCache) Get(key uint64) (*Block, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -79,8 +82,9 @@ func (c *BlockCache) Get(key uint64) (interface{}, bool) {
 		c.protected.MoveToFront(elem)
 	}
 
-	if !item.pinned && item.hits >= c.pinMinHits {
+	if !item.pinned && item.hits >= c.pinMinHits && c.pinnedCount < c.pinMaxItems {
 		item.pinned = true
+		c.pinnedCount++
 	}
 
 	c.rebalanceLocked()
@@ -89,7 +93,7 @@ func (c *BlockCache) Get(key uint64) (interface{}, bool) {
 	return item.value, true
 }
 
-func (c *BlockCache) Put(key uint64, value interface{}, size int) {
+func (c *BlockCache) Put(key uint64, value *Block, size int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -114,8 +118,9 @@ func (c *BlockCache) Put(key uint64, value interface{}, size int) {
 		c.curSize -= int64(oldSize)
 		c.curSize += int64(size)
 		item.hits++
-		if !item.pinned && item.hits >= c.pinMinHits {
+		if !item.pinned && item.hits >= c.pinMinHits && c.pinnedCount < c.pinMaxItems {
 			item.pinned = true
+			c.pinnedCount++
 		}
 		c.rebalanceLocked()
 		return
@@ -163,6 +168,9 @@ func (c *BlockCache) Delete(key uint64) {
 	}
 	delete(c.cache, key)
 	c.curSize -= int64(item.size)
+	if item.pinned {
+		c.pinnedCount--
+	}
 }
 
 func (c *BlockCache) Clear() {
@@ -175,6 +183,7 @@ func (c *BlockCache) Clear() {
 	c.curSize = 0
 	c.probSize = 0
 	c.protSize = 0
+	c.pinnedCount = 0
 }
 
 func (c *BlockCache) Size() int64 {
@@ -216,6 +225,25 @@ func (c *BlockCache) Stats() (hits, misses, evictions int64, hitRate float64) {
 	}
 
 	return c.hits, c.misses, c.evictions, hitRate
+}
+
+func (c *BlockCache) SegmentStats() map[string]interface{} {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return map[string]interface{}{
+		"probation_bytes": c.probSize,
+		"protected_bytes": c.protSize,
+		"protected_max":   c.protMax,
+		"probation_items": c.probation.Len(),
+		"protected_items": c.protected.Len(),
+		"pinned_items":    c.pinnedCount,
+		"total_items":     len(c.cache),
+		"total_bytes":     c.curSize,
+		"max_bytes":       c.maxSize,
+		"pin_min_hits":    c.pinMinHits,
+		"pin_max_items":   c.pinMaxItems,
+	}
 }
 
 func (c *BlockCache) Resize(newMaxSize int64) {
@@ -317,6 +345,9 @@ func (c *BlockCache) evictFromListLocked(l *list.List, seg uint8) bool {
 		c.probSize -= int64(item.size)
 	} else {
 		c.protSize -= int64(item.size)
+	}
+	if item.pinned {
+		c.pinnedCount--
 	}
 	c.evictions++
 	return true

@@ -1,19 +1,18 @@
 # RediGo - 高性能 Redis 兼容服务器
 
-
 ## 📖 项目简介
 
-RediGo 是一个使用 Go 语言实现的高性能、Redis 协议兼容的键值存储服务器。支持内存模式和 LSM Tree 持久化模式，提供灵活的数据持久化选项。
+RediGo 是一个使用 Go 语言实现的高性能、Redis 协议兼容的键值存储服务器。当前项目主线已经转向**自主研发存储引擎**：上层服务仍由 Go 实现，底层持久化内核由 Rust 编写并通过桥接层接回 Go，而不是继续沿用旧版 LSM 路线或直接封装现成存储库。
 
 ### ✨ 核心特性
 
 - ✅ **Redis 协议兼容** - 支持 33+ 个常用 Redis 命令
 - ✅ **高性能网络层** - 支持标准库 net 和 **gnet (Reactor 模式)** 双引擎切换
-- ✅ **双模式运行** - 内存模式 / LSM Tree 持久化模式
+- ✅ **双模式运行** - 内存模式 / 自研持久化引擎模式
 - ✅ **极致并发** - **分段锁 (Sharded Locks)** 设计，显著减少锁竞争
 - ✅ **低分配协议链路** - RESP 解析 `args` 走 `[][]byte`，控制拷贝时机
 - ✅ **热点快路径** - GET/SET/INCR 绕过通用分发与通用编码，降低延迟与分配
-- ✅ **高性能存储** - LevelDB/RocksDB 风格的 LSM Tree 引擎
+- ✅ **自主研发引擎** - 面向 RediGo 负载重新设计的数据链路与恢复机制
 - ✅ **并发安全** - 完整的读写锁机制
 - ✅ **数据过期** - 支持 TTL/PTTL 精确过期控制
 - ✅ **多数据库** - 16 个独立数据库（db\_0 \~ db\_15）
@@ -99,7 +98,6 @@ RediGo/
 ├── cmd/                      # 命令行入口
 │   ├── server/              # 服务器入口
 │   └── client/              # 客户端入口
-│   └── bench/               # 基准工具入口
 │
 ├── config/                   # 配置管理
 │   └── config.go            # 配置定义和加载
@@ -116,16 +114,17 @@ RediGo/
 │   ├── datastruct/          # 数据结构
 │   │   └── data.go          # DataValue 定义
 │   │
-│   ├── persistence/         # LSM Tree 持久化引擎
-│   │   ├── README.md        # 持久化模块详细文档
-│   │   ├── lsm_engine.go    # LSM 引擎主逻辑
-│   │   ├── memtable.go      # MemTable (跳表)
-│   │   ├── sstable.go       # SSTable 读写
-│   │   ├── bloom_filter.go  # Bloom Filter
-│   │   ├── block_cache.go   # Block Cache (LRU)
-│   │   ├── wal.go           # Write-Ahead Logging
-│   │   ├── compaction.go    # Compaction 合并
-│   │   └── ...              # 其他组件
+│   ├── persistence/         # 旧版 LSM 持久化实现（已禁用，仅保留作迁移参考）
+│   │   └── ...              # 迁移参考代码
+│   │
+│   ├── rustengine/          # Go <-> Rust 引擎桥接层
+│   │   └── engine.go        # DLL 加载与调用封装
+│   │
+│   ├── ..\..\engine_v2\     # Rust 新存储引擎
+│   │   ├── src/engine.rs    # 引擎主逻辑
+│   │   ├── src/segment.rs   # segment log 读写
+│   │   ├── src/snapshot.rs  # snapshot / 延迟回收
+│   │   └── src/ffi.rs       # C ABI / DLL 导出
 │   │
 │   ├── protocol/            # Redis 协议解析
 │   │   └── parser.go        # RESP 协议解析器
@@ -152,7 +151,7 @@ RediGo/
 │   └── redigo-server
 │
 ├── data/                     # 数据目录（gitignore）
-│   └── db_*/                # 各数据库的 LSM 文件
+│   └── db_*/                # 各数据库的新引擎数据文件
 │
 └── logs/                     # 日志目录（gitignore）
     ├── redigo.pid            # 后台服务 PID（脚本生成）
@@ -236,33 +235,62 @@ go run ./cmd/server -config ./config.yaml
 
 ## 🏗️ 架构设计
 
-### 整体架构
+### 当前持久化路线
 
-[🖼️ 在线查看详细架构图 / View Architecture Diagram Online](https://TZJ-BYTE.github.io/RediGo/docs/architecture.html)
+当前默认持久化主线已经切换为 `engine_v2`，而且这条路线的目标不是“换一个现成库”，而是**自主研发 RediGo 自己的存储引擎**。
 
-### LSM Tree 架构
+这条路线的边界很明确：
 
-详见：[`internal/persistence/README.md`](internal/persistence/README.md)
+- 允许借鉴成熟思想，但**不直接依赖现成存储引擎库**
+- 不再把旧版 `internal/persistence` LSM 实现作为未来主线
+- 不机械复刻 `LSM-Tree / B+Tree` 的标准教材结构
+- 以 RediGo 的真实负载、键模式、恢复要求和演进目标为第一约束
 
-### 智能冷热分层（现状与演进）
+当前实现状态：
 
-- **文件热度（已实现）**：以 SSTable 文件为粒度统计读热度，在 Compaction 选择输入时优先合并冷文件、在容量压力可控时延迟合并热文件，降低热数据被频繁重写带来的写放大与抖动。
-- **Block 热度 + SLRU/Pinning（已实现）**：Block Cache 采用 SLRU（probation/protected）并对高命中 block 做 pinning 倾向；缓存为引擎级共享，减少跨表碎片与重复缓存。
-- **L0 细粒度策略（已实现）**：L0 compaction 输入不再全量选择，改为基于 key-range 重叠的最小集合并迭代扩展，减少不必要的“全量搬运”与抖动。
-- **Key 热度 Top-K（已实现基础统计）**：对读命中的 key 做 Top-K（heavy hitters）统计，当前用于可观测性与后续策略扩展。
-- **调度与背压（已实现基础版）**：后台任务采用预算调度并联动写入压力与缓存命中率；写入繁忙/缓存命中偏低时会延后 compaction/offload，L0 风险升高时优先 compaction，避免 CPU/IO 突刺影响前台延迟。
+- 核心实现使用 Rust 编写
+- Go 侧通过 `internal/rustengine` 在运行时加载 Rust DLL
+- 数据库层已经接入 `put/get/delete/load_all/reset/close/stats`
+- 旧 `internal/persistence` LSM 实现已默认禁用，仅保留作迁移参考
+
+当前引擎已经具备：
+
+- 崩溃恢复
+- 批量写入
+- snapshot
+- reader cache
+- 单轮与多轮压实
+- 冷启动 `load_all / lazy_load`
+
+### 自研引擎设计原则
+
+RediGo 的新引擎路线不是“找一个现成方案照抄”，而是按下面的原则自己定义链路：
+
+- **从业务场景出发**：先看 Redis-like 负载、键前缀模式、TTL、冷热数据分布，再定内核结构
+- **先做最小但完整的闭环**：写入、读取、恢复、回收都必须先成立，再谈复杂优化
+- **持久化链路自己掌控**：数据格式、恢复语义、checkpoint、cleaner 都由项目自己定义
+- **允许吸收成熟思想**：可以借鉴 ART、checkpoint、COW、snapshot、segment cleaner，但不直接嵌入现成数据库
+- **面向后续演进**：后面可以继续升级索引结构、blob 管理、TTL 清理和分布式场景支持
+
+### 当前架构抽象
+
+目前已经落地的主链路可以概括成：
+
+`Go 数据库层 -> Rust 引擎桥接层 -> engine_v2 -> segment log / checkpoint / snapshot / cleaner`
+
+也就是说，RediGo 现在走的是“**上层 Redis 兼容服务 + 自研底层存储引擎**”这条路线。
 
 ***
 
 ## 📊 性能指标
 
-### 写入性能（LSM Mode）
+### 写入性能（当前目标）
 
-| 指标     | 目标值          | 实测值          |
-| ------ | ------------ | ------------ |
-| 吞吐量    | > 200K ops/s | \~150K ops/s |
-| WAL 延迟 | < 1ms        | < 0.5ms      |
-| 压缩率    | > 50%        | \~60%        |
+| 指标    | 目标值          | 实测值          |
+| ----- | ------------ | ------------ |
+| 吞吐量   | > 200K ops/s | \~150K ops/s |
+| 持久化延迟 | < 1ms        | 持续优化中        |
+| 恢复闭环  | 可恢复          | 已具备基础能力      |
 
 ### 读取性能
 
@@ -274,85 +302,10 @@ go run ./cmd/server -config ./config.yaml
 
 ### 内存效率
 
-- MemTable 大小：4MB（可配置）
-- Block Cache：100MB（可配置，默认启用；引擎级共享 SLRU）
-- Bloom Filter：10 bits/key（可配置）
+- 当前 reader cache 已可用，后续会继续补更细粒度缓存
+- 大 value 分离、索引结构升级、空间回收策略仍在持续演进
 
-***
-
-## ☁️ 存算分离 (MinIO/S3)
-
-RediGo 支持将冷数据自动卸载到 MinIO 或兼容 S3 的对象存储，实现“容量按需扩展、计算与存储解耦”。
-
-### 意义
-
-- **容量解耦**：SSTable 可以落在对象存储，避免本地磁盘成为容量瓶颈；扩容从“加盘”变为“扩 bucket”。
-- **成本优化**：热数据留在本地 SSD，冷数据放对象存储；在大数据量场景下，单位成本通常更低。
-- **弹性与运维**：计算节点可水平扩展/缩容；数据不必跟着计算节点一起迁移，适配云原生/短生命周期实例。
-- **容灾与持久性**：对象存储天然提供较高的持久性与跨区域能力（取决于你的对象存储配置）。
-
-### 当前实现范围
-
-- **文件级别卸载**：以 SSTable 文件为单位上传/下载（不是 Block 级别按需拉取）。
-- **回源读取**：本地缺失 SSTable 时，会自动从对象存储下载回本地再打开继续读。
-- **触发时机**：flush/compaction 产出的 SSTable 会按策略尝试卸载。
-
-### 权衡
-
-- **延迟**：命中本地 SSD 依然快；但回源下载会显著增加尾延迟，适合“冷数据低频访问”的场景。
-- **一致性与可观测性**：对象存储读写失败、网络抖动需要额外监控与重试策略（基础版已支持失败返回）。
-- **带宽/费用**：跨网/跨地域访问会引入带宽占用与可能的出网费用。
-
-### 1. 启动 MinIO
-
-使用 Docker 快速启动 MinIO：
-
-```bash
-docker run -p 9000:9000 -p 9001:9001 \
-  -e "MINIO_ROOT_USER=<access_key>" \
-  -e "MINIO_ROOT_PASSWORD=<secret_key>" \
-  minio/minio server /data --console-address ":9001"
-```
-
-### 2. 配置 RediGo
-
-存算分离默认关闭（`OffloadEnabled=false`）。需要时可在 `config/config.go` 或通过环境变量（`REDIGO_OFFLOAD_*`）显式启用卸载：
-
-```go
-// config.go (DefaultConfig)
-OffloadEnabled:   true,
-OffloadBackend:   "minio",
-OffloadEndpoint:  "127.0.0.1:9000",
-OffloadAccessKey: "<access_key>",
-OffloadSecretKey: "<secret_key>",
-OffloadBucket:    "redigo-data",
-OffloadRegion:    "us-east-1",
-OffloadBasePrefix: "redigo/",
-```
-
-等价的环境变量写法：
-
-```bash
-export REDIGO_OFFLOAD_ENABLED=true
-export REDIGO_OFFLOAD_BACKEND=minio
-export REDIGO_OFFLOAD_ENDPOINT=127.0.0.1:9000
-export REDIGO_OFFLOAD_ACCESS_KEY=<access_key>
-export REDIGO_OFFLOAD_SECRET_KEY=<secret_key>
-export REDIGO_OFFLOAD_BUCKET=redigo-data
-export REDIGO_OFFLOAD_REGION=us-east-1
-export REDIGO_OFFLOAD_BASE_PREFIX=redigo/
-```
-
-### 3. 验证
-
-启动 RediGo 后，SSTable 文件会被上传到 MinIO 的 Bucket 中；当本地 SSTable 文件缺失时，读取会自动从对象存储回源下载后继续读。
-
-也可以直接跑测试验证：
-
-```bash
-go test ./internal/persistence -run TestOffloading_FSBackend_ReadBack -v
-go test ./internal/persistence -run TestOffloading_MinIOBackend_ReadBack -v
-```
+对象存储 offload 属于默认关闭的可选实验能力，不是 RediGo 的核心依赖；当前主线仍然是把**自研本地存储引擎**先做扎实，日常开发、测试和大多数单机场景都不需要引入 MinIO。
 
 ***
 
@@ -361,13 +314,13 @@ go test ./internal/persistence -run TestOffloading_MinIOBackend_ReadBack -v
 ### 运行单元测试
 
 ```bash
-go test -count=1 ./...
+go test ./cmd/... ./config ./internal/... ./pkg/... ./tests/...
 ```
 
 ### 运行竞态检测（推荐）
 
 ```bash
-go test -race -count=1 ./...
+go test -race ./cmd/... ./config ./internal/... ./pkg/... ./tests/...
 ```
 
 在 Windows 上 `-race` 需要启用 CGO 并确保 `gcc` 可用（例如 MSYS2 UCRT64 的 `C:\msys64\ucrt64\bin` 在 PATH 中）。
@@ -375,16 +328,14 @@ go test -race -count=1 ./...
 ### 运行特定包测试
 
 ```bash
-go test ./internal/persistence -v
+go test ./internal/rustengine -v
 go test ./internal/database -v
 go test ./internal/command -v
 ```
 
 ### 性能基准测试
 
-```bash
-go test ./internal/persistence -bench=. -benchmem
-```
+当前性能基准以新引擎链路为主，基准脚本与指标会随 `engine_v2` 的演进持续调整。
 
 ***
 
@@ -433,13 +384,15 @@ netstat -an | grep 16379
 ### 核心文档
 
 - **主文档**: [`README.md`](README.md)（本文件）
-- **持久化模块**: [`internal/persistence/README.md`](internal/persistence/README.md) - 包含 LSM Tree 的详细设计、配置、故障排查和最佳实践。
+- **存储引擎评估**: [`docs/storage_engine_rewrite_assessment.md`](docs/storage_engine_rewrite_assessment.md) - 对当前存储引擎的主要问题、是否值得重写、语言选型与落地路径的整理。
+- **引擎架构说明**: [`docs/engine_v2_architecture.md`](docs/engine_v2_architecture.md) - 当前自研引擎的模块、恢复、cleaner 与 snapshot 设计说明。
+- **问题修复记录**: [`docs/system_issues_fix.md`](docs/system_issues_fix.md) - 现有系统问题、修复思路与迁移过程记录。
 
 ### 外部参考
 
 - [Redis Protocol Specification](https://redis.io/topics/protocol)
-- [LevelDB Paper](https://leveldb.appspot.com/)
-- [The Log-Structured Merge-Tree](https://www.cs.umb.edu/~poneil/lsmtree.pdf)
+- [The Adaptive Radix Tree: ARTful Indexing for Main-Memory Databases](https://db.in.tum.de/~leis/papers/ART.pdf)
+- [Architecture of a Database System](https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf)
 
 ***
 
@@ -470,28 +423,29 @@ netstat -an | grep 16379
 
 ## 🎯 路线图
 
-### v1.0 (已完成)
+### 已完成
 
 - ✅ 基础 Redis 命令支持
-- ✅ LSM Tree 持久化引擎
 - ✅ gnet 高性能网络层
 - ✅ 分段锁并发优化
 - ✅ 多数据库支持
 - ✅ 过期键管理
+- ✅ Rust 自研存储引擎主线接回 Go
 
-### v1.1 (进行中)
+### 当前主线
 
-- ✅ 智能冷热分层 (Hot/Cold Tiering)
-- ✅ Key-Value 分离 (WiscKey / vLog)
-- ✅ 存算分离 (S3/MinIO Offloading)
+- ✅ `engine_v2` 基础读写链路
+- ✅ 崩溃恢复 / checkpoint / snapshot / cleaner
+- ✅ `load_all` / `lazy_load`
+- ✅ Go <-> Rust 桥接层
+- 进行中：继续完善自研引擎的数据结构、空间管理、批量语义和缓存体系
 
-### v2.0 (未来)
+### 后续路线
 
-- [ ] Serverless 架构支持
-- [ ] 更智能冷热分层：Key 热度统计与策略
-- [ ] 更智能冷热分层：Block 热度与 Cache Pinning/分区缓存
-- [ ] 更智能冷热分层：L0 细粒度 Compaction（按重叠范围切分）
-- [ ] 更智能冷热分层：后台调度与背压（Compaction/Offload 联动）
+- [ ] 继续深化自研索引结构与内存布局
+- [ ] 完善 blob 管理与空间回收
+- [ ] 增强批量写入与恢复语义
+- [ ] 构建更稳定的后台调度与清理机制
 - [ ] 分布式事务
 - [ ] 监控 Dashboard
 
@@ -512,4 +466,4 @@ TZJ-BYTE
 
 **RediGo** - 让 Redis 协议实现更简单！ 🚀
 
-*最后更新时间：2026-03-14*
+*最后更新时间：2026-07-15*

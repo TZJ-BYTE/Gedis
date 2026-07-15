@@ -78,7 +78,7 @@ func NewSSTable(file *os.File, options *Options) (*SSTable, error) {
 
 // OpenSSTable 打开已有的 SSTable 文件
 func OpenSSTable(filename string, options *Options) (*SSTable, error) {
-	file, err := os.OpenFile(filename, os.O_RDONLY, 0644)
+	file, err := os.Open(filename)
 	if err != nil {
 		return nil, err
 	}

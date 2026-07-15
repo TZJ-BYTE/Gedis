@@ -1,9 +1,11 @@
 package datastruct
 
 import (
-	"encoding/gob"
 	"bytes"
+	"encoding/binary"
+	"encoding/gob"
 	"fmt"
+	"math"
 	"sort"
 	"time"
 )
@@ -75,33 +77,22 @@ func (dv *DataValue) IsExpired() bool {
 
 // Serialize 序列化 DataValue
 func (dv *DataValue) Serialize() ([]byte, error) {
+	if b, ok := dv.serializeV3(); ok {
+		return b, nil
+	}
+
 	var buf bytes.Buffer
-
-	// 写入前缀 0x02，表示 v1.1 格式（包含 LastAccessedAt）
 	buf.WriteByte(0x02)
-
 	encoder := gob.NewEncoder(&buf)
-	
-	// 先写入 ExpireTime
-	err := encoder.Encode(dv.ExpireTime)
-	if err != nil {
+	if err := encoder.Encode(dv.ExpireTime); err != nil {
 		return nil, err
 	}
-	
-	// 写入 LastAccessedAt
-	err = encoder.Encode(dv.LastAccessedAt)
-	if err != nil {
+	if err := encoder.Encode(dv.LastAccessedAt); err != nil {
 		return nil, err
 	}
-
-	// 再写入 Value
-	// 注意：必须传入接口的指针，以便 Gob 编码类型信息，
-	// 这样解码时 Decode(&interface{}) 才能正确工作。
-	err = encoder.Encode(&dv.Value)
-	if err != nil {
+	if err := encoder.Encode(&dv.Value); err != nil {
 		return nil, err
 	}
-	
 	return buf.Bytes(), nil
 }
 
@@ -112,30 +103,30 @@ func DeserializeDataValue(data []byte) (*DataValue, error) {
 	}
 
 	buf := bytes.NewBuffer(data)
-	
-	// 检查并去除前缀
+
 	prefix, err := buf.ReadByte()
 	if err == nil {
+		if prefix == 0x03 {
+			return deserializeDataValueV3(buf)
+		}
 		if prefix != 0x01 && prefix != 0x02 {
-			// 没有已知前缀，回退（尝试兼容旧数据）
 			buf.UnreadByte()
-			// 假设是 v1.0 (0x01) 的变体或者无前缀旧数据，默认为 v1.0 处理逻辑
-			prefix = 0x01 
+			prefix = 0x01
 		}
 	}
-	
+
 	decoder := gob.NewDecoder(buf)
-	
+
 	// 使用对象池
 	dv := NewDataValue()
-	
+
 	// 先读取 ExpireTime
 	err = decoder.Decode(&dv.ExpireTime)
 	if err != nil {
 		FreeDataValue(dv) // 失败归还
 		return nil, err
 	}
-	
+
 	// 根据版本读取 LastAccessedAt
 	if prefix == 0x02 {
 		err = decoder.Decode(&dv.LastAccessedAt)
@@ -156,9 +147,289 @@ func DeserializeDataValue(data []byte) (*DataValue, error) {
 		FreeDataValue(dv) // 失败归还
 		return nil, fmt.Errorf("failed to decode value: %w", err)
 	}
-	
+
 	dv.Value = value
-	
+
+	return dv, nil
+}
+
+func (dv *DataValue) serializeV3() ([]byte, bool) {
+	out := make([]byte, 0, 128)
+	out = append(out, 0x03)
+	var tmp [8]byte
+	binary.LittleEndian.PutUint64(tmp[:], uint64(dv.ExpireTime))
+	out = append(out, tmp[:]...)
+	binary.LittleEndian.PutUint64(tmp[:], uint64(dv.LastAccessedAt))
+	out = append(out, tmp[:]...)
+
+	switch v := dv.Value.(type) {
+	case *String:
+		out = append(out, 1)
+		out = appendU32(out, uint32(len(v.Data)))
+		out = append(out, v.Data...)
+		return out, true
+	case *BytesString:
+		out = append(out, 2)
+		out = appendU32(out, uint32(len(v.Data)))
+		out = append(out, v.Data...)
+		return out, true
+	case *List:
+		out = append(out, 3)
+		out = appendU32(out, uint32(len(v.Data)))
+		for i := range v.Data {
+			s := v.Data[i]
+			out = appendU32(out, uint32(len(s)))
+			out = append(out, s...)
+		}
+		return out, true
+	case *Hash:
+		out = append(out, 4)
+		if v.Data == nil {
+			out = appendU32(out, 0)
+			return out, true
+		}
+		keys := make([]string, 0, len(v.Data))
+		for k := range v.Data {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		out = appendU32(out, uint32(len(keys)))
+		for _, k := range keys {
+			val := v.Data[k]
+			out = appendU32(out, uint32(len(k)))
+			out = append(out, k...)
+			out = appendU32(out, uint32(len(val)))
+			out = append(out, val...)
+		}
+		return out, true
+	case *Set:
+		out = append(out, 5)
+		if v.Data == nil {
+			out = appendU32(out, 0)
+			return out, true
+		}
+		members := make([]string, 0, len(v.Data))
+		for m := range v.Data {
+			members = append(members, m)
+		}
+		sort.Strings(members)
+		out = appendU32(out, uint32(len(members)))
+		for _, m := range members {
+			out = appendU32(out, uint32(len(m)))
+			out = append(out, m...)
+		}
+		return out, true
+	case *ZSet:
+		out = append(out, 6)
+		if v.Data == nil {
+			out = appendU32(out, 0)
+			return out, true
+		}
+		members := make([]string, 0, len(v.Data))
+		for m := range v.Data {
+			members = append(members, m)
+		}
+		sort.Strings(members)
+		out = appendU32(out, uint32(len(members)))
+		for _, m := range members {
+			score := v.Data[m]
+			out = appendU32(out, uint32(len(m)))
+			out = append(out, m...)
+			var fb [8]byte
+			binary.LittleEndian.PutUint64(fb[:], math.Float64bits(score))
+			out = append(out, fb[:]...)
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func appendU32(dst []byte, v uint32) []byte {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], v)
+	return append(dst, b[:]...)
+}
+
+func deserializeDataValueV3(buf *bytes.Buffer) (*DataValue, error) {
+	data := buf.Bytes()
+	pos := 0
+	read := func(n int) ([]byte, bool) {
+		if pos+n > len(data) {
+			return nil, false
+		}
+		b := data[pos : pos+n]
+		pos += n
+		return b, true
+	}
+
+	b, ok := read(8)
+	if !ok {
+		return nil, fmt.Errorf("corrupt data")
+	}
+	expire := int64(binary.LittleEndian.Uint64(b))
+	b, ok = read(8)
+	if !ok {
+		return nil, fmt.Errorf("corrupt data")
+	}
+	last := int64(binary.LittleEndian.Uint64(b))
+	tb, ok := read(1)
+	if !ok {
+		return nil, fmt.Errorf("corrupt data")
+	}
+	typ := tb[0]
+
+	dv := NewDataValue()
+	dv.ExpireTime = expire
+	dv.LastAccessedAt = last
+
+	switch typ {
+	case 1:
+		lb, ok := read(4)
+		if !ok {
+			FreeDataValue(dv)
+			return nil, fmt.Errorf("corrupt data")
+		}
+		n := int(binary.LittleEndian.Uint32(lb))
+		sb, ok := read(n)
+		if !ok {
+			FreeDataValue(dv)
+			return nil, fmt.Errorf("corrupt data")
+		}
+		dv.Value = &String{Data: string(sb)}
+	case 2:
+		lb, ok := read(4)
+		if !ok {
+			FreeDataValue(dv)
+			return nil, fmt.Errorf("corrupt data")
+		}
+		n := int(binary.LittleEndian.Uint32(lb))
+		vb, ok := read(n)
+		if !ok {
+			FreeDataValue(dv)
+			return nil, fmt.Errorf("corrupt data")
+		}
+		out := make([]byte, n)
+		copy(out, vb)
+		dv.Value = &BytesString{Data: out}
+	case 3:
+		lb, ok := read(4)
+		if !ok {
+			FreeDataValue(dv)
+			return nil, fmt.Errorf("corrupt data")
+		}
+		cnt := int(binary.LittleEndian.Uint32(lb))
+		arr := make([]string, 0, cnt)
+		for i := 0; i < cnt; i++ {
+			lb, ok := read(4)
+			if !ok {
+				FreeDataValue(dv)
+				return nil, fmt.Errorf("corrupt data")
+			}
+			n := int(binary.LittleEndian.Uint32(lb))
+			sb, ok := read(n)
+			if !ok {
+				FreeDataValue(dv)
+				return nil, fmt.Errorf("corrupt data")
+			}
+			arr = append(arr, string(sb))
+		}
+		dv.Value = &List{Data: arr}
+	case 4:
+		lb, ok := read(4)
+		if !ok {
+			FreeDataValue(dv)
+			return nil, fmt.Errorf("corrupt data")
+		}
+		cnt := int(binary.LittleEndian.Uint32(lb))
+		m := make(map[string]string, cnt)
+		for i := 0; i < cnt; i++ {
+			kl, ok := read(4)
+			if !ok {
+				FreeDataValue(dv)
+				return nil, fmt.Errorf("corrupt data")
+			}
+			kn := int(binary.LittleEndian.Uint32(kl))
+			kb, ok := read(kn)
+			if !ok {
+				FreeDataValue(dv)
+				return nil, fmt.Errorf("corrupt data")
+			}
+			vl, ok := read(4)
+			if !ok {
+				FreeDataValue(dv)
+				return nil, fmt.Errorf("corrupt data")
+			}
+			vn := int(binary.LittleEndian.Uint32(vl))
+			vb, ok := read(vn)
+			if !ok {
+				FreeDataValue(dv)
+				return nil, fmt.Errorf("corrupt data")
+			}
+			m[string(kb)] = string(vb)
+		}
+		dv.Value = &Hash{Data: m}
+	case 5:
+		lb, ok := read(4)
+		if !ok {
+			FreeDataValue(dv)
+			return nil, fmt.Errorf("corrupt data")
+		}
+		cnt := int(binary.LittleEndian.Uint32(lb))
+		m := make(map[string]struct{}, cnt)
+		for i := 0; i < cnt; i++ {
+			kl, ok := read(4)
+			if !ok {
+				FreeDataValue(dv)
+				return nil, fmt.Errorf("corrupt data")
+			}
+			kn := int(binary.LittleEndian.Uint32(kl))
+			kb, ok := read(kn)
+			if !ok {
+				FreeDataValue(dv)
+				return nil, fmt.Errorf("corrupt data")
+			}
+			m[string(kb)] = struct{}{}
+		}
+		dv.Value = &Set{Data: m}
+	case 6:
+		lb, ok := read(4)
+		if !ok {
+			FreeDataValue(dv)
+			return nil, fmt.Errorf("corrupt data")
+		}
+		cnt := int(binary.LittleEndian.Uint32(lb))
+		m := make(map[string]float64, cnt)
+		scores := make([]ZSetMember, 0, cnt)
+		for i := 0; i < cnt; i++ {
+			kl, ok := read(4)
+			if !ok {
+				FreeDataValue(dv)
+				return nil, fmt.Errorf("corrupt data")
+			}
+			kn := int(binary.LittleEndian.Uint32(kl))
+			kb, ok := read(kn)
+			if !ok {
+				FreeDataValue(dv)
+				return nil, fmt.Errorf("corrupt data")
+			}
+			sb, ok := read(8)
+			if !ok {
+				FreeDataValue(dv)
+				return nil, fmt.Errorf("corrupt data")
+			}
+			score := math.Float64frombits(binary.LittleEndian.Uint64(sb))
+			member := string(kb)
+			m[member] = score
+			scores = append(scores, ZSetMember{Member: member, Score: score})
+		}
+		dv.Value = &ZSet{Data: m, Scores: scores}
+	default:
+		FreeDataValue(dv)
+		return nil, fmt.Errorf("unknown value type")
+	}
+
+	buf.Next(pos)
 	return dv, nil
 }
 
@@ -212,7 +483,7 @@ func (l *List) Range(start, stop int) []string {
 	if length == 0 {
 		return []string{}
 	}
-	
+
 	// 处理负数索引
 	if start < 0 {
 		start = length + start
@@ -220,7 +491,7 @@ func (l *List) Range(start, stop int) []string {
 	if stop < 0 {
 		stop = length + stop
 	}
-	
+
 	// 边界检查
 	if start < 0 {
 		start = 0
@@ -228,11 +499,11 @@ func (l *List) Range(start, stop int) []string {
 	if stop >= length {
 		stop = length - 1
 	}
-	
+
 	if start > stop {
 		return []string{}
 	}
-	
+
 	return l.Data[start : stop+1]
 }
 
@@ -345,10 +616,10 @@ func (zs *ZSet) Add(member string, score float64) bool {
 	if zs.Data == nil {
 		zs.Data = make(map[string]float64)
 	}
-	
+
 	_, exists := zs.Data[member]
 	zs.Data[member] = score
-	
+
 	// 更新排序列表
 	zs.updateScores()
 	return !exists
@@ -385,7 +656,7 @@ func (zs *ZSet) updateScores() {
 			Score:  score,
 		})
 	}
-	
+
 	// 按分数排序
 	sort.Slice(zs.Scores, func(i, j int) bool {
 		return zs.Scores[i].Score < zs.Scores[j].Score

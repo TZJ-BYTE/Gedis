@@ -13,6 +13,7 @@ import (
 	"github.com/TZJ-BYTE/RediGo/config"
 	"github.com/TZJ-BYTE/RediGo/internal/datastruct"
 	"github.com/TZJ-BYTE/RediGo/internal/persistence"
+	"github.com/TZJ-BYTE/RediGo/internal/rustengine"
 	"github.com/TZJ-BYTE/RediGo/pkg/logger"
 )
 
@@ -37,9 +38,12 @@ const (
 
 // DatabaseConfig 数据库配置
 type DatabaseConfig struct {
-	Type    DatabaseType         // 数据库类型
-	DataDir string               // 数据目录（仅 LSM 模式需要）
-	Options *persistence.Options // LSM 选项（仅 LSM 模式需要）
+	Type              DatabaseType         // 数据库类型
+	DataDir           string               // 数据目录（仅 LSM 模式需要）
+	Options           *persistence.Options // LSM 选项（仅 LSM 模式需要）
+	ColdStartStrategy string
+	WriteMode         string
+	Durability        string
 }
 
 // shard 分段结构
@@ -54,21 +58,39 @@ type Database struct {
 	shards [ShardCount]shard
 
 	// LSM 引擎（可选）
-	lsmEngine *persistence.LSMEnergy
-	config    *DatabaseConfig
-	keyHeat   *KeyTopK
+	lsmEngine       *persistence.LSMEnergy
+	rustEngine      *rustengine.Engine
+	config          *DatabaseConfig
+	keyHeat         *KeyTopK
+	lsmPutErrors    atomic.Uint64
+	lsmDeleteErrors atomic.Uint64
+	lsmLastError    atomic.Value
+	lsmDeleteStop   atomic.Value
+	lsmDeleteWG     sync.WaitGroup
+	lsmDeleteCh     chan string
+	lsmDeleteEnq    atomic.Uint64
+	lsmDeleteDrop   atomic.Uint64
 
 	// 内存管理
 	usedMemory     int64  // 当前使用内存（字节），原子操作
 	maxMemory      int64  // 最大内存限制（字节）
 	evictionPolicy string // 淘汰策略
+
+	expireStop atomic.Value
+	expireWG   sync.WaitGroup
+
+	expireRuns          atomic.Uint64
+	expireScanned       atomic.Uint64
+	expireExpired       atomic.Uint64
+	expireDurationNanos atomic.Uint64
 }
 
 // DefaultDatabaseConfig 返回默认配置
 func DefaultDatabaseConfig() *DatabaseConfig {
 	return &DatabaseConfig{
-		Type:    MemoryOnly,
-		DataDir: "",
+		Type:              MemoryOnly,
+		DataDir:           "",
+		ColdStartStrategy: "no_load",
 	}
 }
 
@@ -81,6 +103,8 @@ func NewDatabase(id int) *Database {
 		maxMemory:      cfg.MaxMemory,
 		evictionPolicy: cfg.MaxMemoryPolicy,
 	}
+	db.expireStop.Store((chan struct{})(nil))
+	db.lsmDeleteStop.Store((chan struct{})(nil))
 	if strings.Contains(db.evictionPolicy, "lru") {
 		db.keyHeat = NewKeyTopK(1024)
 	}
@@ -98,6 +122,8 @@ func NewDatabaseWithConfig(id int, dbConfig *DatabaseConfig) (*Database, error) 
 		maxMemory:      globalConfig.MaxMemory,
 		evictionPolicy: globalConfig.MaxMemoryPolicy,
 	}
+	db.expireStop.Store((chan struct{})(nil))
+	db.lsmDeleteStop.Store((chan struct{})(nil))
 	if strings.Contains(db.evictionPolicy, "lru") {
 		db.keyHeat = NewKeyTopK(1024)
 	}
@@ -114,33 +140,28 @@ func NewDatabaseWithConfig(id int, dbConfig *DatabaseConfig) (*Database, error) 
 		}
 
 		var err error
-		db.lsmEngine, err = persistence.OpenLSMEnergy(dbConfig.DataDir, options)
+		db.rustEngine, err = rustengine.Open(rustengine.Options{
+			DataDir:            dbConfig.DataDir,
+			SegmentSizeBytes:   uint64(options.MemTableSize),
+			CheckpointAfterOps: 1024,
+			SyncPolicy:         rustSyncPolicy(dbConfig.Durability),
+		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to open LSM engine: %v", err)
+			return nil, fmt.Errorf("failed to open Rust engine: %v", err)
 		}
+		db.lsmDeleteCh = make(chan string, 4096)
+		db.StartLSMDeleteWorker()
 
-		// 根据冷启动策略加载数据
-		strategy := getColdStartStrategyFromConfig()
-
-		// 强制默认使用 lazy_load 以支持持久化测试
-		if strategy == "no_load" {
-			strategy = "lazy_load"
-		}
-
+		strategy := strings.ToLower(strings.TrimSpace(dbConfig.ColdStartStrategy))
 		switch strategy {
 		case "load_all":
 			// 全量加载到内存
-			if err := db.loadAllFromLSM(); err != nil {
+			if err := db.loadAllFromPersistence(); err != nil {
 				logger.Warn("Failed to load all data from LSM: %v", err)
 			}
 		case "lazy_load":
-			// 懒加载：不主动加载，读取时 fallback
-			// 为了确保测试通过（测试中期望重启后立即能读取到数据，而此时内存是空的）
-			// 我们在这里也执行一次 loadAllFromLSM，但允许失败
-			if err := db.loadAllFromLSM(); err != nil {
-				logger.Warn("Failed to load all data from LSM (lazy_load preload): %v", err)
-			}
-			logger.Info("LSM lazy load enabled (preloaded for test compat), will fallback on read")
+			logger.Info("LSM lazy load enabled, will fallback on read")
+		case "no_load", "":
 		default:
 			// 不加载（默认）
 			logger.Info("LSM cold start: no data loading")
@@ -150,18 +171,114 @@ func NewDatabaseWithConfig(id int, dbConfig *DatabaseConfig) (*Database, error) 
 	return db, nil
 }
 
-// getColdStartStrategyFromConfig 从全局配置读取冷启动策略
-func getColdStartStrategyFromConfig() string {
-	cfg := config.DefaultConfig()
-	// 将字符串配置转换为对应的策略
-	switch cfg.ColdStartStrategy {
-	case "load_all":
-		return "load_all"
-	case "lazy_load":
-		return "lazy_load"
-	default:
-		return "no_load"
+func (db *Database) StartExpireCleaner() {
+	ch := make(chan struct{})
+	if !db.expireStop.CompareAndSwap((chan struct{})(nil), ch) {
+		close(ch)
+		return
 	}
+
+	db.expireWG.Add(1)
+	go func() {
+		defer db.expireWG.Done()
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				start := time.Now()
+				db.expireRuns.Add(1)
+				scanned, expired := db.expireSample(time.Now().UnixMilli(), 64)
+				db.expireScanned.Add(uint64(scanned))
+				db.expireExpired.Add(uint64(expired))
+				db.expireDurationNanos.Add(uint64(time.Since(start).Nanoseconds()))
+			case <-ch:
+				return
+			}
+		}
+	}()
+}
+
+func (db *Database) StopExpireCleaner() {
+	cur, _ := db.expireStop.Load().(chan struct{})
+	if cur == nil {
+		return
+	}
+	if db.expireStop.CompareAndSwap(cur, (chan struct{})(nil)) {
+		close(cur)
+		db.expireWG.Wait()
+	}
+}
+
+func (db *Database) StartLSMDeleteWorker() {
+	if db == nil || !db.hasPersistence() || db.lsmDeleteCh == nil {
+		return
+	}
+	ch := make(chan struct{})
+	if !db.lsmDeleteStop.CompareAndSwap((chan struct{})(nil), ch) {
+		close(ch)
+		return
+	}
+	db.lsmDeleteWG.Add(1)
+	go func() {
+		defer db.lsmDeleteWG.Done()
+		for {
+			select {
+			case <-ch:
+				return
+			case k := <-db.lsmDeleteCh:
+				_ = db.lsmDelete(k)
+			}
+		}
+	}()
+}
+
+func (db *Database) StopLSMDeleteWorker() {
+	cur, _ := db.lsmDeleteStop.Load().(chan struct{})
+	if cur == nil {
+		return
+	}
+	if db.lsmDeleteStop.CompareAndSwap(cur, (chan struct{})(nil)) {
+		close(cur)
+		db.lsmDeleteWG.Wait()
+	}
+}
+
+func (db *Database) enqueueExpiredLSMDelete(key string) {
+	if db == nil || !db.hasPersistence() || db.lsmDeleteCh == nil {
+		return
+	}
+	db.lsmDeleteEnq.Add(1)
+	select {
+	case db.lsmDeleteCh <- key:
+	default:
+		db.lsmDeleteDrop.Add(1)
+	}
+}
+
+func (db *Database) expireSample(nowMs int64, samples int) (scanned int, expired int) {
+	for i := 0; i < samples; i++ {
+		shard := &db.shards[rand.Intn(ShardCount)]
+		shard.lock.RLock()
+		var k string
+		var v *datastruct.DataValue
+		for kk, vv := range shard.data {
+			k = kk
+			v = vv
+			break
+		}
+		shard.lock.RUnlock()
+		if k == "" || v == nil {
+			continue
+		}
+		scanned++
+		if v.ExpireTime > 0 && nowMs > v.ExpireTime {
+			if db.Delete(k) {
+				expired++
+			}
+		}
+	}
+	return scanned, expired
 }
 
 // getShardIndex 获取分段索引
@@ -183,7 +300,7 @@ func (db *Database) loadAllFromLSM() error {
 	}
 
 	logger.Info("Loading all data from LSM into memory...")
-	fmt.Printf("[DATABASE] Loading all keys from LSM... SSTable count: %d\n", db.lsmEngine.GetSSTableCount())
+	logger.Info("Loading all keys from LSM... SSTable count: %d", db.lsmEngine.GetSSTableCount())
 
 	// 使用 LSM Engine 提供的公开方法加载所有键值对
 	allData, err := db.lsmEngine.LoadAllKeys()
@@ -236,6 +353,73 @@ func deserializeDataValue(data []byte) (*datastruct.DataValue, error) {
 // updateMemoryUsage 更新内存使用量
 func (db *Database) updateMemoryUsage(delta int64) {
 	atomic.AddInt64(&db.usedMemory, delta)
+}
+
+func (db *Database) persistenceWriteMode() string {
+	if db == nil || db.config == nil || db.config.WriteMode == "" {
+		return "strong"
+	}
+	return strings.ToLower(db.config.WriteMode)
+}
+
+func (db *Database) persistenceDurability() string {
+	if db == nil || db.config == nil || db.config.Durability == "" {
+		return "wal_fsync"
+	}
+	return strings.ToLower(db.config.Durability)
+}
+
+func (db *Database) recordLSMError(err error) {
+	if err == nil {
+		return
+	}
+	db.lsmLastError.Store(err.Error())
+}
+
+func (db *Database) lsmPut(key string, value []byte) error {
+	if db == nil || !db.hasPersistence() {
+		return nil
+	}
+	var err error
+	switch {
+	case db.rustEngine != nil:
+		err = db.rustEngine.Put(stringToBytesRO(key), value)
+	case db.lsmEngine != nil:
+		err = db.lsmEngine.Put(stringToBytesRO(key), value)
+	}
+	if err != nil {
+		db.lsmPutErrors.Add(1)
+		db.recordLSMError(err)
+		if db.persistenceWriteMode() == "weak" {
+			logger.Error("Failed to write to LSM: %v", err)
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func (db *Database) lsmDelete(key string) error {
+	if db == nil || !db.hasPersistence() {
+		return nil
+	}
+	var err error
+	switch {
+	case db.rustEngine != nil:
+		err = db.rustEngine.Delete(stringToBytesRO(key))
+	case db.lsmEngine != nil:
+		err = db.lsmEngine.Delete(stringToBytesRO(key))
+	}
+	if err != nil {
+		db.lsmDeleteErrors.Add(1)
+		db.recordLSMError(err)
+		if db.persistenceWriteMode() == "weak" {
+			logger.Error("Failed to delete from LSM: %v", err)
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // evictIfNeeded 检查内存是否超限并尝试淘汰
@@ -335,6 +519,15 @@ func (db *Database) Get(key string) (*datastruct.DataValue, bool) {
 	if exists && value != nil {
 		// 检查过期
 		if value.IsExpired() {
+			shard.lock.Lock()
+			cur := shard.data[key]
+			if cur != nil && cur.IsExpired() {
+				delete(shard.data, key)
+				memDelta := int64(len(key)) + cur.ApproximateSize()
+				db.updateMemoryUsage(-memDelta)
+			}
+			shard.lock.Unlock()
+			db.enqueueExpiredLSMDelete(strings.Clone(key))
 			return nil, false
 		}
 		if db.keyHeat != nil {
@@ -344,8 +537,13 @@ func (db *Database) Get(key string) (*datastruct.DataValue, bool) {
 	}
 
 	// 内存中没有，尝试从 LSM 读取（懒加载）
-	if db.lsmEngine != nil {
-		valBytes, found := db.lsmEngine.Get(stringToBytesRO(key))
+	if db.hasPersistence() {
+		valBytes, found, err := db.persistenceGet(key)
+		if err != nil {
+			db.recordLSMError(err)
+			logger.Warn("Failed to read key %s from persistence: %v", key, err)
+			return nil, false
+		}
 		if found {
 			// 反序列化
 			dataValue, err := datastruct.DeserializeDataValue(valBytes)
@@ -357,13 +555,7 @@ func (db *Database) Get(key string) (*datastruct.DataValue, bool) {
 
 			// 检查过期
 			if dataValue.IsExpired() {
-				// 异步删除过期数据
-				k := strings.Clone(key)
-				go func(k string) {
-					if err := db.lsmEngine.Delete(stringToBytesRO(k)); err != nil {
-						logger.Warn("Failed to delete expired key %s from LSM: %v", k, err)
-					}
-				}(k)
+				db.enqueueExpiredLSMDelete(strings.Clone(key))
 				return nil, false
 			}
 
@@ -371,6 +563,9 @@ func (db *Database) Get(key string) (*datastruct.DataValue, bool) {
 
 			// 加载到内存（热点数据）
 			shard.lock.Lock()
+			if shard.data == nil {
+				shard.data = make(map[string]*datastruct.DataValue)
+			}
 			// 双重检查
 			if existingValue, ok := shard.data[stableKey]; ok {
 				shard.lock.Unlock()
@@ -471,17 +666,19 @@ func (db *Database) Set(key string, value *datastruct.DataValue) error {
 	}
 	shard.lock.Unlock()
 
-	// 如果启用了 LSM，同时写入 LSM 引擎
-	if db.lsmEngine != nil {
-		// 将数据序列化后写入 LSM
+	if db.hasPersistence() {
 		dataBytes, err := value.Serialize()
-		if err == nil {
-			err = db.lsmEngine.Put(stringToBytesRO(key), dataBytes)
-			if err != nil {
-				logger.Error("Failed to write to LSM: %v", err)
+		if err != nil {
+			db.recordLSMError(err)
+			if db.persistenceWriteMode() == "weak" {
+				logger.Error("Failed to serialize value for key %s: %v", key, err)
+			} else {
+				return err
 			}
 		} else {
-			logger.Error("Failed to serialize value for key %s: %v", key, err)
+			if err := db.lsmPut(key, dataBytes); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -506,32 +703,28 @@ func (db *Database) SetBytes(key []byte, value *datastruct.DataValue) error {
 	return db.Set(bytesToString(key), value)
 }
 
-// Delete 删除键
-func (db *Database) Delete(key string) bool {
+func (db *Database) DeleteWithError(key string) (bool, error) {
 	shard := db.getShard(key)
 	shard.lock.Lock()
 	_, exists := shard.data[key]
 
-	// 从内存删除
 	if exists {
 		val := shard.data[key]
 		delete(shard.data, key)
-		// 更新内存统计
 		memDelta := int64(len(key)) + val.ApproximateSize()
 		db.updateMemoryUsage(-memDelta)
 	}
 	shard.lock.Unlock()
 
-	// 如果启用了 LSM，始终尝试从 LSM 删除
-	// 无论内存中是否存在，LSM 中可能存在（例如懒加载或数据不一致）
-	if db.lsmEngine != nil {
-		err := db.lsmEngine.Delete(stringToBytesRO(key))
-		if err != nil {
-			logger.Error("Failed to delete from LSM: %v", err)
-		}
+	if err := db.lsmDelete(key); err != nil {
+		return exists, err
 	}
+	return exists, nil
+}
 
-	return exists
+func (db *Database) Delete(key string) bool {
+	ok, _ := db.DeleteWithError(key)
+	return ok
 }
 
 func (db *Database) DeleteBytes(key []byte) bool {
@@ -542,10 +735,24 @@ func (db *Database) DeleteBytes(key []byte) bool {
 func (db *Database) Exists(key string) bool {
 	shard := db.getShard(key)
 	shard.lock.RLock()
-	defer shard.lock.RUnlock()
-
 	value, exists := shard.data[key]
-	return exists && value != nil && !value.IsExpired()
+	shard.lock.RUnlock()
+	if !exists || value == nil {
+		return false
+	}
+	if value.IsExpired() {
+		shard.lock.Lock()
+		cur := shard.data[key]
+		if cur != nil && cur.IsExpired() {
+			delete(shard.data, key)
+			memDelta := int64(len(key)) + cur.ApproximateSize()
+			db.updateMemoryUsage(-memDelta)
+		}
+		shard.lock.Unlock()
+		db.enqueueExpiredLSMDelete(strings.Clone(key))
+		return false
+	}
+	return true
 }
 
 // Expire 设置过期时间
@@ -598,23 +805,28 @@ func (db *Database) Size() int {
 }
 
 // Clear 清空数据库
-func (db *Database) Clear() {
+func (db *Database) Clear() error {
 	for i := 0; i < ShardCount; i++ {
 		shard := &db.shards[i]
 		shard.lock.Lock()
 		shard.data = nil
 		shard.lock.Unlock()
 	}
-
-	// 如果启用了 LSM，清空 LSM 引擎（通过删除所有 SSTable）
-	// 注意：这是一个重量级操作，实际实现可能需要优化
-	if db.lsmEngine != nil {
-		// TODO: 实现 LSM 的清空操作
+	atomic.StoreInt64(&db.usedMemory, 0)
+	if db.keyHeat != nil {
+		db.keyHeat.Clear()
 	}
+
+	if db.hasPersistence() {
+		return db.persistenceReset()
+	}
+	return nil
 }
 
 // Close 关闭数据库
 func (db *Database) Close() error {
+	db.StopExpireCleaner()
+	db.StopLSMDeleteWorker()
 	// 这里不需要对所有 shards 加锁，因为 Close 意味着系统正在关闭
 	// 但为了安全起见，我们还是可以加锁，或者直接关闭 LSM
 	for i := 0; i < ShardCount; i++ {
@@ -623,8 +835,8 @@ func (db *Database) Close() error {
 		shard.lock.Unlock()
 	}
 
-	if db.lsmEngine != nil {
-		return db.lsmEngine.Close()
+	if db.hasPersistence() {
+		return db.persistenceClose()
 	}
 	return nil
 }
@@ -645,11 +857,27 @@ func (db *Database) GetStats() map[string]interface{} {
 	stats["used_memory_bytes"] = atomic.LoadInt64(&db.usedMemory)
 	stats["max_memory_bytes"] = db.maxMemory
 	stats["max_memory_policy"] = db.evictionPolicy
+	stats["expire_runs"] = db.expireRuns.Load()
+	stats["expire_scanned"] = db.expireScanned.Load()
+	stats["expire_expired"] = db.expireExpired.Load()
+	stats["expire_duration_ms"] = float64(db.expireDurationNanos.Load()) / 1e6
+	stats["persistence_write_mode"] = db.persistenceWriteMode()
+	stats["persistence_durability"] = db.persistenceDurability()
+	stats["lsm_put_errors"] = db.lsmPutErrors.Load()
+	stats["lsm_delete_errors"] = db.lsmDeleteErrors.Load()
+	stats["lsm_delete_queue_len"] = len(db.lsmDeleteCh)
+	stats["lsm_delete_queue_enqueued"] = db.lsmDeleteEnq.Load()
+	stats["lsm_delete_queue_dropped"] = db.lsmDeleteDrop.Load()
+	if v := db.lsmLastError.Load(); v != nil {
+		stats["lsm_last_error"] = v.(string)
+	} else {
+		stats["lsm_last_error"] = ""
+	}
 
-	if db.lsmEngine != nil {
-		stats["mode"] = "LSM"
+	if db.hasPersistence() {
+		stats["mode"] = db.persistenceMode()
 		stats["lsm_enabled"] = true
-		stats["lsm"] = db.lsmEngine.GetStats()
+		stats["lsm"] = db.persistenceStats()
 	} else {
 		stats["mode"] = "Memory"
 		stats["lsm_enabled"] = false

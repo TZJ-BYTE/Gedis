@@ -1,0 +1,11 @@
+[package]
+name = "engine_v2"
+version = "0.1.0"
+edition = "2024"
+description = "RediGo 的新一代存储引擎原型：segment log + 内存索引 + checkpoint"
+license = "MIT"
+
+[lib]
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]

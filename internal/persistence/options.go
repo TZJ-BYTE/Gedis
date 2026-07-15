@@ -62,6 +62,9 @@ type Options struct {
 	// SyncWAL 每次写入后是否同步到磁盘（更安全但更慢）
 	SyncWAL bool
 
+	WALQueueSize      int
+	WALWriteTimeoutMs int
+
 	// ========== WiscKey (Value Log) 配置 ==========
 
 	// ValueThreshold 写入 Value Log 的阈值（字节）
@@ -140,8 +143,10 @@ func DefaultOptions() *Options {
 		MaxOpenFiles: 500,
 
 		// WAL 配置
-		WriteAheadLog: true,
-		SyncWAL:       false, // 性能优先
+		WriteAheadLog:     true,
+		SyncWAL:           false, // 性能优先
+		WALQueueSize:      4096,
+		WALWriteTimeoutMs: 200,
 
 		// WiscKey 配置
 		ValueThreshold: 64,
@@ -188,6 +193,12 @@ func (o *Options) Validate() error {
 
 	if o.BlockSize < 1024 { // 最小 1KB
 		o.BlockSize = 1024
+	}
+	if o.WALQueueSize <= 0 {
+		o.WALQueueSize = 4096
+	}
+	if o.WALWriteTimeoutMs < 0 {
+		o.WALWriteTimeoutMs = 0
 	}
 
 	if o.BloomFPRate <= 0 || o.BloomFPRate > 0.1 {

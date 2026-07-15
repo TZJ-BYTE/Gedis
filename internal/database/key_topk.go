@@ -132,3 +132,11 @@ func (t *KeyTopK) Top(n int) []KeyCount {
 
 	return out[:n]
 }
+
+func (t *KeyTopK) Clear() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.m = make(map[string]*keyEntry, t.k)
+	t.h = make(keyMinHeap, 0, t.k)
+	heap.Init(&t.h)
+}

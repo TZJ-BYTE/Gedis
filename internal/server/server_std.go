@@ -15,6 +15,17 @@ import (
 	"github.com/TZJ-BYTE/RediGo/pkg/logger"
 )
 
+func writeAllConn(conn net.Conn, b []byte) error {
+	for len(b) > 0 {
+		n, err := conn.Write(b)
+		if err != nil {
+			return err
+		}
+		b = b[n:]
+	}
+	return nil
+}
+
 // StdServer 基于标准库 net 的 Redis 服务器
 type StdServer struct {
 	config    *config.Config
@@ -31,10 +42,12 @@ func NewStdServer(cfg *config.Config) network.Server {
 
 	// 初始化命令注册表
 	command.InitDefaultCommands()
+	manager := database.NewDBManager(cfg)
+	command.SetDBManager(manager)
 
 	return &StdServer{
 		config:    cfg,
-		dbManager: database.NewDBManager(cfg),
+		dbManager: manager,
 		registry:  command.DefaultRegistry,
 		ctx:       ctx,
 		cancel:    cancel,
@@ -114,7 +127,7 @@ func (s *StdServer) handleConnection(conn net.Conn) {
 			resp := protocol.MakeError(err)
 			connCtx.respBuf = protocol.EncodeResponseInto(connCtx.respBuf, resp)
 			protocol.ReleaseResponse(resp)
-			conn.Write(connCtx.respBuf)
+			_ = writeAllConn(conn, connCtx.respBuf)
 			continue
 		}
 		if n == 0 {
@@ -130,7 +143,7 @@ func (s *StdServer) handleConnection(conn net.Conn) {
 				resp := protocol.MakeError(perr)
 				connCtx.writeBuf = protocol.AppendResponse(connCtx.writeBuf, resp)
 				protocol.ReleaseResponse(resp)
-				conn.Write(connCtx.writeBuf)
+				_ = writeAllConn(conn, connCtx.writeBuf)
 				return
 			}
 			if consumed == 0 {
@@ -157,7 +170,10 @@ func (s *StdServer) handleConnection(conn net.Conn) {
 		}
 
 		if len(connCtx.writeBuf) > 0 {
-			conn.Write(connCtx.writeBuf)
+			if err := writeAllConn(conn, connCtx.writeBuf); err != nil {
+				logger.Error("写入响应错误：%v", err)
+				return
+			}
 		}
 	}
 }

@@ -5,7 +5,6 @@ import (
 	"strconv"
 
 	"github.com/TZJ-BYTE/RediGo/internal/database"
-	"github.com/TZJ-BYTE/RediGo/internal/datastruct"
 	"github.com/TZJ-BYTE/RediGo/internal/protocol"
 )
 
@@ -20,38 +19,11 @@ func (c *HSetCommand) Execute(db *database.Database, args [][]byte) *protocol.Re
 	key := argString(args, 0)
 	field := argString(args, 1)
 	value := argString(args, 2)
-
-	valueObj, exists := db.Get(key)
-	var hash *datastruct.Hash
-
-	if !exists {
-		hash = &datastruct.Hash{
-			Data: make(map[string]string),
-		}
-	} else {
-		h, ok := valueObj.Value.(*datastruct.Hash)
-		if !ok {
-			return protocol.MakeError(errors.New("WRONGTYPE Operation against a key holding the wrong kind of value"))
-		}
-		hash = h
-	}
-
-	// 检查字段是否已存在
-	_, fieldExists := hash.Data[field]
-	hash.Set(field, value)
-
-	if err := db.Set(key, &datastruct.DataValue{
-		Value:      hash,
-		ExpireTime: 0,
-	}); err != nil {
+	created, err := db.HSet(key, field, value)
+	if err != nil {
 		return protocol.MakeError(err)
 	}
-
-	// 如果字段不存在，返回 1；如果字段已存在并更新了值，返回 0
-	if !fieldExists {
-		return protocol.MakeInteger(1)
-	}
-	return protocol.MakeInteger(0)
+	return protocol.MakeInteger(created)
 }
 
 // HGetCommand HGET 命令
@@ -64,23 +36,14 @@ func (c *HGetCommand) Execute(db *database.Database, args [][]byte) *protocol.Re
 
 	key := argString(args, 0)
 	field := argString(args, 1)
-
-	value, exists := db.Get(key)
-	if !exists {
-		return protocol.MakeNull()
+	v, ok, err := db.HGet(key, field)
+	if err != nil {
+		return protocol.MakeError(err)
 	}
-
-	hash, ok := value.Value.(*datastruct.Hash)
 	if !ok {
-		return protocol.MakeError(errors.New("WRONGTYPE Operation against a key holding the wrong kind of value"))
-	}
-
-	fieldValue, fieldExists := hash.Get(field)
-	if !fieldExists {
 		return protocol.MakeNull()
 	}
-
-	return protocol.MakeBulkString(fieldValue)
+	return protocol.MakeBulkString(v)
 }
 
 // HMSetCommand HMSET 命令
@@ -92,36 +55,15 @@ func (c *HMSetCommand) Execute(db *database.Database, args [][]byte) *protocol.R
 	}
 
 	key := argString(args, 0)
-
-	valueObj, exists := db.Get(key)
-	var hash *datastruct.Hash
-
-	if !exists {
-		hash = &datastruct.Hash{
-			Data: make(map[string]string),
-		}
-	} else {
-		h, ok := valueObj.Value.(*datastruct.Hash)
-		if !ok {
-			return protocol.MakeError(errors.New("WRONGTYPE Operation against a key holding the wrong kind of value"))
-		}
-		hash = h
-	}
-
-	// 批量设置字段值
+	fields := make([]string, 0, (len(args)-1)/2)
+	values := make([]string, 0, (len(args)-1)/2)
 	for i := 1; i < len(args); i += 2 {
-		field := argString(args, i)
-		value := argString(args, i+1)
-		hash.Set(field, value)
+		fields = append(fields, argString(args, i))
+		values = append(values, argString(args, i+1))
 	}
-
-	if err := db.Set(key, &datastruct.DataValue{
-		Value:      hash,
-		ExpireTime: 0,
-	}); err != nil {
+	if err := db.HMSet(key, fields, values); err != nil {
 		return protocol.MakeError(err)
 	}
-
 	return protocol.MakeSimpleString("OK")
 }
 
@@ -134,30 +76,23 @@ func (c *HMGetCommand) Execute(db *database.Database, args [][]byte) *protocol.R
 	}
 
 	key := argString(args, 0)
-
-	value, exists := db.Get(key)
-	if !exists {
-		// 返回 null 数组
-		result := make([]string, len(args)-1)
-		return protocol.MakeArray(result)
-	}
-
-	hash, ok := value.Value.(*datastruct.Hash)
-	if !ok {
-		return protocol.MakeError(errors.New("WRONGTYPE Operation against a key holding the wrong kind of value"))
-	}
-
-	// 获取所有字段的值
-	result := make([]string, 0, len(args)-1)
+	fields := make([]string, 0, len(args)-1)
 	for i := 1; i < len(args); i++ {
-		if fieldValue, fieldExists := hash.Get(argString(args, i)); fieldExists {
-			result = append(result, fieldValue)
-		} else {
-			result = append(result, "") // 不存在的字段返回空字符串
-		}
+		fields = append(fields, argString(args, i))
 	}
-
-	return protocol.MakeArray(result)
+	result, ok, err := db.HMGetWithExists(key, fields)
+	if err != nil {
+		return protocol.MakeError(err)
+	}
+	resp := make([]*protocol.Response, len(result))
+	for i := range result {
+		if !ok[i] {
+			resp[i] = protocol.MakeNull()
+			continue
+		}
+		resp[i] = protocol.MakeBulkString(result[i])
+	}
+	return protocol.MakeArrayResponses(resp)
 }
 
 // HDelCommand HDEL 命令
@@ -169,31 +104,15 @@ func (c *HDelCommand) Execute(db *database.Database, args [][]byte) *protocol.Re
 	}
 
 	key := argString(args, 0)
-
-	value, exists := db.Get(key)
-	if !exists {
-		return protocol.MakeInteger(0)
-	}
-
-	hash, ok := value.Value.(*datastruct.Hash)
-	if !ok {
-		return protocol.MakeError(errors.New("WRONGTYPE Operation against a key holding the wrong kind of value"))
-	}
-
-	// 删除所有指定字段
-	count := 0
+	fields := make([]string, 0, len(args)-1)
 	for i := 1; i < len(args); i++ {
-		if hash.Delete(argString(args, i)) {
-			count++
-		}
+		fields = append(fields, argString(args, i))
 	}
-
-	// 如果哈希为空，删除整个键
-	if hash.Size() == 0 {
-		db.Delete(key)
+	n, err := db.HDel(key, fields)
+	if err != nil {
+		return protocol.MakeError(err)
 	}
-
-	return protocol.MakeInteger(int64(count))
+	return protocol.MakeInteger(n)
 }
 
 // HLenCommand HLEN 命令
@@ -205,18 +124,11 @@ func (c *HLenCommand) Execute(db *database.Database, args [][]byte) *protocol.Re
 	}
 
 	key := argString(args, 0)
-
-	value, exists := db.Get(key)
-	if !exists {
-		return protocol.MakeInteger(0)
+	n, err := db.HLen(key)
+	if err != nil {
+		return protocol.MakeError(err)
 	}
-
-	hash, ok := value.Value.(*datastruct.Hash)
-	if !ok {
-		return protocol.MakeError(errors.New("WRONGTYPE Operation against a key holding the wrong kind of value"))
-	}
-
-	return protocol.MakeInteger(int64(hash.Size()))
+	return protocol.MakeInteger(n)
 }
 
 // HExistsCommand HEXISTS 命令
@@ -229,19 +141,11 @@ func (c *HExistsCommand) Execute(db *database.Database, args [][]byte) *protocol
 
 	key := argString(args, 0)
 	field := argString(args, 1)
-
-	value, exists := db.Get(key)
-	if !exists {
-		return protocol.MakeInteger(0)
+	ok, err := db.HExists(key, field)
+	if err != nil {
+		return protocol.MakeError(err)
 	}
-
-	hash, ok := value.Value.(*datastruct.Hash)
-	if !ok {
-		return protocol.MakeError(errors.New("WRONGTYPE Operation against a key holding the wrong kind of value"))
-	}
-
-	_, fieldExists := hash.Get(field)
-	if fieldExists {
+	if ok {
 		return protocol.MakeInteger(1)
 	}
 	return protocol.MakeInteger(0)
@@ -256,23 +160,10 @@ func (c *HKeysCommand) Execute(db *database.Database, args [][]byte) *protocol.R
 	}
 
 	key := argString(args, 0)
-
-	value, exists := db.Get(key)
-	if !exists {
-		return protocol.MakeArray([]string{})
+	keys, err := db.HKeys(key)
+	if err != nil {
+		return protocol.MakeError(err)
 	}
-
-	hash, ok := value.Value.(*datastruct.Hash)
-	if !ok {
-		return protocol.MakeError(errors.New("WRONGTYPE Operation against a key holding the wrong kind of value"))
-	}
-
-	// 获取所有字段名
-	keys := make([]string, 0, hash.Size())
-	for field := range hash.Data {
-		keys = append(keys, field)
-	}
-
 	return protocol.MakeArray(keys)
 }
 
@@ -285,23 +176,10 @@ func (c *HValsCommand) Execute(db *database.Database, args [][]byte) *protocol.R
 	}
 
 	key := argString(args, 0)
-
-	value, exists := db.Get(key)
-	if !exists {
-		return protocol.MakeArray([]string{})
+	values, err := db.HVals(key)
+	if err != nil {
+		return protocol.MakeError(err)
 	}
-
-	hash, ok := value.Value.(*datastruct.Hash)
-	if !ok {
-		return protocol.MakeError(errors.New("WRONGTYPE Operation against a key holding the wrong kind of value"))
-	}
-
-	// 获取所有字段值
-	values := make([]string, 0, hash.Size())
-	for _, val := range hash.Data {
-		values = append(values, val)
-	}
-
 	return protocol.MakeArray(values)
 }
 
@@ -314,24 +192,10 @@ func (c *HGetAllCommand) Execute(db *database.Database, args [][]byte) *protocol
 	}
 
 	key := argString(args, 0)
-
-	value, exists := db.Get(key)
-	if !exists {
-		return protocol.MakeArray([]string{})
+	result, err := db.HGetAll(key)
+	if err != nil {
+		return protocol.MakeError(err)
 	}
-
-	hash, ok := value.Value.(*datastruct.Hash)
-	if !ok {
-		return protocol.MakeError(errors.New("WRONGTYPE Operation against a key holding the wrong kind of value"))
-	}
-
-	// 获取所有字段和值（交替返回）
-	result := make([]string, 0, hash.Size()*2)
-	for field, val := range hash.Data {
-		result = append(result, field)
-		result = append(result, val)
-	}
-
 	return protocol.MakeArray(result)
 }
 
@@ -349,44 +213,11 @@ func (c *HIncrByCommand) Execute(db *database.Database, args [][]byte) *protocol
 	if err != nil {
 		return protocol.MakeError(errors.New("ERR value is not an integer or out of range"))
 	}
-
-	value, exists := db.Get(key)
-	var hash *datastruct.Hash
-
-	if !exists {
-		hash = &datastruct.Hash{
-			Data: make(map[string]string),
-		}
-	} else {
-		h, ok := value.Value.(*datastruct.Hash)
-		if !ok {
-			return protocol.MakeError(errors.New("WRONGTYPE Operation against a key holding the wrong kind of value"))
-		}
-		hash = h
+	out, err := db.HIncrBy(key, field, delta)
+	if err != nil {
+		return protocol.MakeError(errors.New(err.Error()))
 	}
-
-	// 获取当前值
-	currentStr, _ := hash.Get(field)
-	var current int64
-	if currentStr != "" {
-		current, err = strconv.ParseInt(currentStr, 10, 64)
-		if err != nil {
-			return protocol.MakeError(errors.New("ERR value is not an integer or out of range"))
-		}
-	}
-
-	// 增加
-	newValue := current + delta
-	hash.Set(field, strconv.FormatInt(newValue, 10))
-
-	if err := db.Set(key, &datastruct.DataValue{
-		Value:      hash,
-		ExpireTime: 0,
-	}); err != nil {
-		return protocol.MakeError(err)
-	}
-
-	return protocol.MakeInteger(newValue)
+	return protocol.MakeInteger(out)
 }
 
 // HIncrByFloatCommand HINCRBYFLOAT 命令
@@ -403,42 +234,9 @@ func (c *HIncrByFloatCommand) Execute(db *database.Database, args [][]byte) *pro
 	if err != nil {
 		return protocol.MakeError(errors.New("ERR value is not a float or out of range"))
 	}
-
-	value, exists := db.Get(key)
-	var hash *datastruct.Hash
-
-	if !exists {
-		hash = &datastruct.Hash{
-			Data: make(map[string]string),
-		}
-	} else {
-		h, ok := value.Value.(*datastruct.Hash)
-		if !ok {
-			return protocol.MakeError(errors.New("WRONGTYPE Operation against a key holding the wrong kind of value"))
-		}
-		hash = h
+	out, err := db.HIncrByFloat(key, field, delta)
+	if err != nil {
+		return protocol.MakeError(errors.New(err.Error()))
 	}
-
-	// 获取当前值
-	currentStr, _ := hash.Get(field)
-	var current float64
-	if currentStr != "" {
-		current, err = strconv.ParseFloat(currentStr, 64)
-		if err != nil {
-			return protocol.MakeError(errors.New("ERR value is not a float or out of range"))
-		}
-	}
-
-	// 增加
-	newValue := current + delta
-	hash.Set(field, strconv.FormatFloat(newValue, 'f', -1, 64))
-
-	if err := db.Set(key, &datastruct.DataValue{
-		Value:      hash,
-		ExpireTime: 0,
-	}); err != nil {
-		return protocol.MakeError(err)
-	}
-
-	return protocol.MakeBulkString(strconv.FormatFloat(newValue, 'f', -1, 64))
+	return protocol.MakeBulkString(strconv.FormatFloat(out, 'f', -1, 64))
 }

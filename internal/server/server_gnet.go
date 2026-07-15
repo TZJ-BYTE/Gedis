@@ -23,9 +23,11 @@ type GnetServer struct {
 
 func NewGnetServer(cfg *config.Config) network.Server {
 	command.InitDefaultCommands()
+	manager := database.NewDBManager(cfg)
+	command.SetDBManager(manager)
 	return &GnetServer{
 		config:    cfg,
-		dbManager: database.NewDBManager(cfg),
+		dbManager: manager,
 		registry:  command.DefaultRegistry,
 	}
 }
@@ -40,7 +42,9 @@ func (s *GnetServer) Stop() error {
 	logger.Info("Stopping gnet server...")
 	// 关闭 DBManager
 	if s.dbManager != nil {
-		s.dbManager.Close()
+		if err := s.dbManager.Close(); err != nil {
+			logger.Warn("关闭 DBManager 失败：%v", err)
+		}
 	}
 	return s.eng.Stop(context.Background())
 }
@@ -72,7 +76,11 @@ func (s *GnetServer) OnClose(c gnet.Conn, err error) gnet.Action {
 
 func (s *GnetServer) OnTraffic(c gnet.Conn) gnet.Action {
 	// 处理粘包
-	data, _ := c.Peek(-1)
+	data, err := c.Peek(-1)
+	if err != nil {
+		logger.Error("Peek error: %v", err)
+		return gnet.Close
+	}
 	if len(data) == 0 {
 		return gnet.None
 	}
@@ -88,7 +96,9 @@ func (s *GnetServer) OnTraffic(c gnet.Conn) gnet.Action {
 			resp := protocol.MakeError(err)
 			connCtx.writeBuf = protocol.AppendResponse(connCtx.writeBuf, resp)
 			protocol.ReleaseResponse(resp)
-			c.Write(connCtx.writeBuf)
+			if _, werr := c.Write(connCtx.writeBuf); werr != nil {
+				logger.Error("Write error: %v", werr)
+			}
 			return gnet.Close
 		}
 
@@ -119,9 +129,15 @@ func (s *GnetServer) OnTraffic(c gnet.Conn) gnet.Action {
 	}
 
 	// 丢弃已处理的数据
-	c.Discard(offset)
+	if _, err := c.Discard(offset); err != nil {
+		logger.Error("Discard error: %v", err)
+		return gnet.Close
+	}
 	if len(connCtx.writeBuf) > 0 {
-		c.Write(connCtx.writeBuf)
+		if _, err := c.Write(connCtx.writeBuf); err != nil {
+			logger.Error("Write error: %v", err)
+			return gnet.Close
+		}
 	}
 
 	return gnet.None

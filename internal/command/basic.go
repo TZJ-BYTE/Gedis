@@ -5,8 +5,9 @@ import (
 	"strconv"
 	"time"
 
+	"path"
+
 	"github.com/TZJ-BYTE/RediGo/internal/database"
-	"github.com/TZJ-BYTE/RediGo/internal/datastruct"
 	"github.com/TZJ-BYTE/RediGo/internal/protocol"
 )
 
@@ -18,8 +19,69 @@ func (c *SetCommand) Execute(db *database.Database, args [][]byte) *protocol.Res
 		return protocol.MakeError(errors.New("ERR wrong number of arguments for 'set' command"))
 	}
 
-	if err := db.SetStringBytes(args[0], args[1]); err != nil {
+	nx := false
+	xx := false
+	var ttlMs int64
+	keepTTL := false
+
+	for i := 2; i < len(args); i++ {
+		opt := args[i]
+		if len(opt) == 0 {
+			return protocol.MakeError(errors.New("ERR syntax error"))
+		}
+		switch {
+		case equalsIgnoreCase(opt, []byte("NX")):
+			if xx {
+				return protocol.MakeError(errors.New("ERR syntax error"))
+			}
+			nx = true
+		case equalsIgnoreCase(opt, []byte("XX")):
+			if nx {
+				return protocol.MakeError(errors.New("ERR syntax error"))
+			}
+			xx = true
+		case equalsIgnoreCase(opt, []byte("KEEPTTL")):
+			if ttlMs != 0 {
+				return protocol.MakeError(errors.New("ERR syntax error"))
+			}
+			keepTTL = true
+		case equalsIgnoreCase(opt, []byte("EX")):
+			if ttlMs != 0 || keepTTL {
+				return protocol.MakeError(errors.New("ERR syntax error"))
+			}
+			if i+1 >= len(args) {
+				return protocol.MakeError(errors.New("ERR syntax error"))
+			}
+			n, err := protocol.ParseInt(args[i+1])
+			if err != nil || n <= 0 {
+				return protocol.MakeError(errors.New("ERR value is not an integer or out of range"))
+			}
+			ttlMs = int64(n) * 1000
+			i++
+		case equalsIgnoreCase(opt, []byte("PX")):
+			if ttlMs != 0 || keepTTL {
+				return protocol.MakeError(errors.New("ERR syntax error"))
+			}
+			if i+1 >= len(args) {
+				return protocol.MakeError(errors.New("ERR syntax error"))
+			}
+			n, err := protocol.ParseInt(args[i+1])
+			if err != nil || n <= 0 {
+				return protocol.MakeError(errors.New("ERR value is not an integer or out of range"))
+			}
+			ttlMs = int64(n)
+			i++
+		default:
+			return protocol.MakeError(errors.New("ERR syntax error"))
+		}
+	}
+
+	set, err := db.SetStringBytesWithOptions(args[0], args[1], ttlMs, keepTTL, nx, xx)
+	if err != nil {
 		return protocol.MakeError(err)
+	}
+	if !set {
+		return protocol.MakeNull()
 	}
 	return protocol.MakeSimpleString("OK")
 }
@@ -32,19 +94,14 @@ func (c *GetCommand) Execute(db *database.Database, args [][]byte) *protocol.Res
 		return protocol.MakeError(errors.New("ERR wrong number of arguments for 'get' command"))
 	}
 
-	value, exists := db.GetBytes(args[0])
-	if !exists {
+	s, ok, err := db.GetStringCopy(args[0])
+	if err != nil {
+		return protocol.MakeError(err)
+	}
+	if !ok {
 		return protocol.MakeNull()
 	}
-
-	switch v := value.Value.(type) {
-	case *datastruct.String:
-		return protocol.MakeBulkString(v.Data)
-	case *datastruct.BytesString:
-		return protocol.MakeBulkString(protocol.BytesToString(v.Data))
-	default:
-		return protocol.MakeError(errors.New("WRONGTYPE Operation against a key holding the wrong kind of value"))
-	}
+	return protocol.MakeBulkString(s)
 }
 
 // DelCommand DEL 命令
@@ -57,7 +114,11 @@ func (c *DelCommand) Execute(db *database.Database, args [][]byte) *protocol.Res
 
 	count := 0
 	for i := range args {
-		if db.Delete(argString(args, i)) {
+		ok, err := db.DeleteWithError(argString(args, i))
+		if err != nil {
+			return protocol.MakeError(err)
+		}
+		if ok {
 			count++
 		}
 	}
@@ -115,13 +176,20 @@ func (c *KeysCommand) Execute(db *database.Database, args [][]byte) *protocol.Re
 	pattern := argString(args, 0)
 	keys := db.Keys()
 
-	// 简单的模式匹配（只支持 *)
 	var result []string
 	if pattern == "*" {
 		result = keys
 	} else {
-		// TODO: 实现完整的模式匹配
-		result = keys
+		result = make([]string, 0, len(keys))
+		for _, k := range keys {
+			ok, err := path.Match(pattern, k)
+			if err != nil {
+				return protocol.MakeError(errors.New("ERR invalid pattern"))
+			}
+			if ok {
+				result = append(result, k)
+			}
+		}
 	}
 
 	return protocol.MakeArray(result)
@@ -131,7 +199,12 @@ func (c *KeysCommand) Execute(db *database.Database, args [][]byte) *protocol.Re
 type FlushDBCommand struct{}
 
 func (c *FlushDBCommand) Execute(db *database.Database, args [][]byte) *protocol.Response {
-	db.Clear()
+	if len(args) != 0 {
+		return protocol.MakeError(errors.New("ERR wrong number of arguments for 'flushdb' command"))
+	}
+	if err := db.Clear(); err != nil {
+		return protocol.MakeError(err)
+	}
 	return protocol.MakeSimpleString("OK")
 }
 
@@ -139,6 +212,9 @@ func (c *FlushDBCommand) Execute(db *database.Database, args [][]byte) *protocol
 type DBSizeCommand struct{}
 
 func (c *DBSizeCommand) Execute(db *database.Database, args [][]byte) *protocol.Response {
+	if len(args) != 0 {
+		return protocol.MakeError(errors.New("ERR wrong number of arguments for 'dbsize' command"))
+	}
 	size := db.Size()
 	return protocol.MakeInteger(int64(size))
 }
@@ -167,18 +243,18 @@ func (c *TtlCommand) Execute(db *database.Database, args [][]byte) *protocol.Res
 	}
 
 	key := argString(args, 0)
-	value, exists := db.Get(key)
+	expireAt, exists := db.GetExpireTime(key)
 	if !exists {
 		return protocol.MakeInteger(-2) // key 不存在
 	}
 
-	if value.ExpireTime == 0 {
+	if expireAt == 0 {
 		return protocol.MakeInteger(-1) // 永不过期
 	}
 
 	// 计算剩余时间（秒）
 	now := time.Now().UnixMilli()
-	remaining := (value.ExpireTime - now) / 1000
+	remaining := (expireAt - now) / 1000
 	if remaining <= 0 {
 		return protocol.MakeInteger(-2) // 已过期
 	}
@@ -195,17 +271,17 @@ func (c *PttlCommand) Execute(db *database.Database, args [][]byte) *protocol.Re
 	}
 
 	key := argString(args, 0)
-	value, exists := db.Get(key)
+	expireAt, exists := db.GetExpireTime(key)
 	if !exists {
 		return protocol.MakeInteger(-2) // key 不存在
 	}
 
-	if value.ExpireTime == 0 {
+	if expireAt == 0 {
 		return protocol.MakeInteger(-1) // 永不过期
 	}
 
 	// 计算剩余时间（毫秒）
-	remaining := value.ExpireTime - time.Now().UnixMilli()
+	remaining := expireAt - time.Now().UnixMilli()
 	if remaining <= 0 {
 		return protocol.MakeInteger(-2) // 已过期
 	}
@@ -251,13 +327,9 @@ func (c *MsetCommand) Execute(db *database.Database, args [][]byte) *protocol.Re
 		return protocol.MakeError(errors.New("ERR wrong number of arguments for 'mset' command"))
 	}
 
-	// 批量设置键值对
-	for i := 0; i < len(args); i += 2 {
-		if err := db.SetStringBytes(args[i], args[i+1]); err != nil {
-			return protocol.MakeError(err)
-		}
+	if err := db.MSetStringBytes(args); err != nil {
+		return protocol.MakeError(err)
 	}
-
 	return protocol.MakeSimpleString("OK")
 }
 
@@ -269,26 +341,20 @@ func (c *MgetCommand) Execute(db *database.Database, args [][]byte) *protocol.Re
 		return protocol.MakeError(errors.New("ERR wrong number of arguments for 'mget' command"))
 	}
 
-	results := make([]string, len(args))
-
-	for i := range args {
-		value, exists := db.GetBytes(args[i])
-		if !exists {
-			results[i] = ""
-			continue
-		}
-
-		switch v := value.Value.(type) {
-		case *datastruct.String:
-			results[i] = v.Data
-		case *datastruct.BytesString:
-			results[i] = protocol.BytesToString(v.Data)
-		default:
-			results[i] = ""
-		}
+	values, ok, err := db.MGetStringCopies(args)
+	if err != nil {
+		return protocol.MakeError(err)
 	}
 
-	return protocol.MakeArray(results)
+	resp := make([]*protocol.Response, len(values))
+	for i := range values {
+		if !ok[i] {
+			resp[i] = protocol.MakeNull()
+			continue
+		}
+		resp[i] = protocol.MakeBulkString(values[i])
+	}
+	return protocol.MakeArrayResponses(resp)
 }
 
 // RenameCommand RENAME 命令
@@ -301,26 +367,10 @@ func (c *RenameCommand) Execute(db *database.Database, args [][]byte) *protocol.
 
 	oldKey := argString(args, 0)
 	newKey := argString(args, 1)
-
-	// 获取旧值
-	value, exists := db.Get(oldKey)
-	if !exists {
-		return protocol.MakeError(errors.New("ERR no such key"))
-	}
-
-	// 如果新旧 key 相同，直接返回
-	if oldKey == newKey {
-		return protocol.MakeSimpleString("OK")
-	}
-
-	// 删除旧 key，设置新 key
-	db.Delete(oldKey)
-	if err := db.Set(newKey, value); err != nil {
-		// 尝试恢复旧 key
-		db.Set(oldKey, value)
+	_, err := db.Rename(oldKey, newKey, false)
+	if err != nil {
 		return protocol.MakeError(err)
 	}
-
 	return protocol.MakeSimpleString("OK")
 }
 
@@ -334,25 +384,12 @@ func (c *RenamenxCommand) Execute(db *database.Database, args [][]byte) *protoco
 
 	oldKey := argString(args, 0)
 	newKey := argString(args, 1)
-
-	// 获取旧值
-	value, exists := db.Get(oldKey)
-	if !exists {
-		return protocol.MakeError(errors.New("ERR no such key"))
-	}
-
-	// 如果新 key 已存在，返回 0
-	if db.Exists(newKey) {
-		return protocol.MakeInteger(0)
-	}
-
-	// 删除旧 key，设置新 key
-	db.Delete(oldKey)
-	if err := db.Set(newKey, value); err != nil {
-		// 尝试恢复旧 key
-		db.Set(oldKey, value)
+	ok, err := db.Rename(oldKey, newKey, true)
+	if err != nil {
 		return protocol.MakeError(err)
 	}
-
+	if !ok {
+		return protocol.MakeInteger(0)
+	}
 	return protocol.MakeInteger(1)
 }

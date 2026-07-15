@@ -3,6 +3,7 @@ package database
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -35,6 +36,7 @@ func NewDBManager(cfg *config.Config) *DBManager {
 	if persistenceEnabled && strings.Contains(strings.ToLower(os.Args[0]), ".test") {
 		persistenceEnabled = false
 	}
+	runBackground := !strings.Contains(strings.ToLower(os.Args[0]), ".test")
 
 	if persistenceEnabled {
 		dataDir = cfg.DataDir
@@ -46,6 +48,14 @@ func NewDBManager(cfg *config.Config) *DBManager {
 		// 可以根据需要调整 LSM 配置
 		lsmOptions.BlockSize = cfg.BlockSize
 		lsmOptions.MemTableSize = cfg.MemTableSize
+		switch strings.ToLower(cfg.PersistenceDurability) {
+		case "", "wal_fsync", "lsm":
+			lsmOptions.SyncWAL = true
+		case "wal":
+			lsmOptions.SyncWAL = false
+		default:
+			lsmOptions.SyncWAL = true
+		}
 
 		// 存算分离配置
 		lsmOptions.EnableOffloading = cfg.OffloadEnabled
@@ -67,7 +77,7 @@ func NewDBManager(cfg *config.Config) *DBManager {
 			logger.Info("启用存算分离 (Backend: FS)")
 		}
 
-		logger.Info("启用 LSM 持久化，数据目录：%s", dataDir)
+		logger.Info("启用 Rust 持久化引擎，数据目录：%s", dataDir)
 	}
 
 	// 创建所有数据库
@@ -77,7 +87,7 @@ func NewDBManager(cfg *config.Config) *DBManager {
 
 		if persistenceEnabled {
 			// 为每个数据库创建独立的子目录
-			dbDataDir := fmt.Sprintf("%s/db_%d", dataDir, i)
+			dbDataDir := filepath.Join(dataDir, fmt.Sprintf("db_%d", i))
 
 			// 为每个 DB 配置独立的前缀（避免对象存储上 Key 冲突）
 			dbOptions := *lsmOptions // 浅拷贝基础配置
@@ -90,9 +100,12 @@ func NewDBManager(cfg *config.Config) *DBManager {
 			}
 
 			dbConfig := &DatabaseConfig{
-				Type:    LSMPersistent,
-				DataDir: dbDataDir,
-				Options: &dbOptions,
+				Type:              LSMPersistent,
+				DataDir:           dbDataDir,
+				Options:           &dbOptions,
+				ColdStartStrategy: cfg.ColdStartStrategy,
+				WriteMode:         cfg.PersistenceWriteMode,
+				Durability:        cfg.PersistenceDurability,
 			}
 
 			db, err = NewDatabaseWithConfig(i, dbConfig)
@@ -107,10 +120,13 @@ func NewDBManager(cfg *config.Config) *DBManager {
 		}
 
 		databases[i] = db
+		if runBackground {
+			db.StartExpireCleaner()
+		}
 	}
 
 	if persistenceEnabled {
-		logger.Info("初始化 %d 个数据库（LSM 持久化模式）", cfg.DBCount)
+		logger.Info("初始化 %d 个数据库（Rust 持久化模式）", cfg.DBCount)
 	} else {
 		logger.Info("初始化 %d 个数据库（纯内存模式）", cfg.DBCount)
 	}
@@ -138,11 +154,14 @@ func (m *DBManager) GetDBByIndex(index int) (*Database, error) {
 }
 
 // FlushAll 清空所有数据库
-func (m *DBManager) FlushAll() {
+func (m *DBManager) FlushAll() error {
 	for _, db := range m.databases {
-		db.Clear()
+		if err := db.Clear(); err != nil {
+			return err
+		}
 	}
 	logger.Info("清空所有数据库")
+	return nil
 }
 
 // DBCount 返回数据库数量

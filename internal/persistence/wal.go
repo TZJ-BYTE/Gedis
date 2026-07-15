@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // WALRecordType WAL 记录类型
@@ -44,13 +46,31 @@ type WALEntry struct {
 
 // WALWriter WAL 写入器
 type WALWriter struct {
-	file        *os.File      // WAL 文件
-	bufWriter   *bufio.Writer // 缓冲写入器
-	mu          sync.Mutex    // 并发控制
-	seqNum      uint64        // 序列号
-	totalSize   int64         // 总大小
-	maxSize     int64         // 最大文件大小（用于轮转）
-	syncOnWrite bool
+	file                *os.File      // WAL 文件
+	bufWriter           *bufio.Writer // 缓冲写入器
+	mu                  sync.Mutex    // 并发控制
+	seqNum              uint64        // 序列号
+	totalSize           int64         // 总大小
+	maxSize             int64         // 最大文件大小（用于轮转）
+	syncOnWrite         bool
+	closed              bool
+	reqCh               chan walRequest
+	wg                  sync.WaitGroup
+	flushBytes          int
+	flushEvery          time.Duration
+	enqueueTimeoutNanos atomic.Int64
+	enqueueCount        atomic.Uint64
+	enqueueTimeouts     atomic.Uint64
+	enqueueWaitNanos    atomic.Uint64
+	enqueueMaxWaitNanos atomic.Uint64
+	queueMaxLen         atomic.Uint64
+}
+
+type walRequest struct {
+	recordType WALRecordType
+	key        []byte
+	value      []byte
+	done       chan error
 }
 
 // WALReader WAL 读取器
@@ -62,7 +82,11 @@ type WALReader struct {
 
 // NewWALWriter 创建 WAL 写入器
 func NewWALWriter(filename string, maxSize int64, syncOnWrite bool) (*WALWriter, error) {
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	return NewWALWriterWithConfig(filename, maxSize, syncOnWrite, 4096, 0)
+}
+
+func NewWALWriterWithConfig(filename string, maxSize int64, syncOnWrite bool, queueSize int, enqueueTimeout time.Duration) (*WALWriter, error) {
+	file, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -74,82 +98,96 @@ func NewWALWriter(filename string, maxSize int64, syncOnWrite bool) (*WALWriter,
 		return nil, err
 	}
 
-	return &WALWriter{
+	if queueSize <= 0 {
+		queueSize = 4096
+	}
+	if enqueueTimeout < 0 {
+		enqueueTimeout = 0
+	}
+
+	w := &WALWriter{
 		file:        file,
-		bufWriter:   bufio.NewWriter(file),
+		bufWriter:   bufio.NewWriterSize(file, 1<<20),
 		seqNum:      0,
 		totalSize:   info.Size(),
 		maxSize:     maxSize,
 		syncOnWrite: syncOnWrite,
-	}, nil
+		reqCh:       make(chan walRequest, queueSize),
+		flushBytes:  1 << 20,
+		flushEvery:  2 * time.Millisecond,
+	}
+	w.enqueueTimeoutNanos.Store(int64(enqueueTimeout))
+	w.wg.Add(1)
+	go w.loop()
+	return w, nil
 }
 
 // Write 写入 WAL 记录
 func (w *WALWriter) Write(recordType WALRecordType, key, value []byte) error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	if w.closed {
+		w.mu.Unlock()
+		return fmt.Errorf("wal is closed")
+	}
+	ch := w.reqCh
+	timeout := time.Duration(w.enqueueTimeoutNanos.Load())
+	w.mu.Unlock()
 
-	// 构建记录
-	record := WALRecord{
-		Type:  recordType,
-		Key:   key,
-		Value: value,
+	done := make(chan error, 1)
+	req := walRequest{recordType: recordType, key: key, value: value, done: done}
+
+	start := time.Now()
+	sent := false
+	var sendPanic any
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				sendPanic = r
+			}
+		}()
+		if timeout <= 0 {
+			ch <- req
+			sent = true
+			return
+		}
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case ch <- req:
+			sent = true
+		case <-timer.C:
+		}
+	}()
+
+	if sendPanic != nil {
+		return fmt.Errorf("wal is closed")
+	}
+	if !sent {
+		w.enqueueTimeouts.Add(1)
+		return fmt.Errorf("wal queue full")
 	}
 
-	// 计算校验和
-	checksum := calculateChecksum(record)
-
-	// 写入记录头：[类型 1 字节][保留 1 字节][序列号 8 字节][Key 长度 4 字节][Value 长度 4 字节][校验和 4 字节]
-	header := make([]byte, 22)
-	header[0] = byte(record.Type)
-	header[1] = 0 // 保留
-	binary.LittleEndian.PutUint64(header[2:10], w.seqNum)
-	binary.LittleEndian.PutUint32(header[10:14], uint32(len(key)))
-	binary.LittleEndian.PutUint32(header[14:18], uint32(len(value)))
-	binary.LittleEndian.PutUint32(header[18:22], checksum)
-
-	// 写入头部
-	_, err := w.bufWriter.Write(header)
-	if err != nil {
-		return err
+	wait := uint64(time.Since(start).Nanoseconds())
+	w.enqueueCount.Add(1)
+	w.enqueueWaitNanos.Add(wait)
+	for {
+		cur := w.enqueueMaxWaitNanos.Load()
+		if wait <= cur || w.enqueueMaxWaitNanos.CompareAndSwap(cur, wait) {
+			break
+		}
 	}
-
-	// 写入 Key
-	if len(key) > 0 {
-		_, err := w.bufWriter.Write(key)
-		if err != nil {
-			return err
+	if ch != nil {
+		ql := uint64(len(ch))
+		for {
+			cur := w.queueMaxLen.Load()
+			if ql <= cur || w.queueMaxLen.CompareAndSwap(cur, ql) {
+				break
+			}
 		}
 	}
 
-	// 写入 Value
-	if len(value) > 0 {
-		_, err := w.bufWriter.Write(value)
-		if err != nil {
-			return err
-		}
-	}
-
-	// 刷新缓冲区
-	err = w.bufWriter.Flush()
-	if err != nil {
-		return err
-	}
-
-	// 同步到磁盘
-	if w.syncOnWrite {
-		err = w.file.Sync()
-		if err != nil {
-			return err
-		}
-	}
-
-	// 更新状态
-	w.seqNum++
-	recordSize := int64(22 + len(key) + len(value))
-	w.totalSize += recordSize
-
-	return nil
+	return <-done
 }
 
 // Put 写入 Put 操作
@@ -164,6 +202,17 @@ func (w *WALWriter) Delete(key []byte) error {
 
 // Close 关闭 WAL 写入器
 func (w *WALWriter) Close() error {
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return nil
+	}
+	w.closed = true
+	close(w.reqCh)
+	w.mu.Unlock()
+
+	w.wg.Wait()
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -181,6 +230,127 @@ func (w *WALWriter) Close() error {
 
 	// 关闭文件
 	return w.file.Close()
+}
+
+func (w *WALWriter) loop() {
+	defer w.wg.Done()
+
+	var batch []walRequest
+	var batchBytes int
+	var batchStart time.Time
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+
+		w.mu.Lock()
+		err := w.writeBatchLocked(batch)
+		w.mu.Unlock()
+
+		for _, r := range batch {
+			r.done <- err
+		}
+		batch = batch[:0]
+		batchBytes = 0
+		batchStart = time.Time{}
+	}
+
+	for req := range w.reqCh {
+		if len(batch) == 0 {
+			batchStart = time.Now()
+		}
+		batch = append(batch, req)
+		batchBytes += 22 + len(req.key) + len(req.value)
+
+	drain:
+		for batchBytes < w.flushBytes && time.Since(batchStart) < w.flushEvery {
+			select {
+			case r, ok := <-w.reqCh:
+				if !ok {
+					flush()
+					return
+				}
+				batch = append(batch, r)
+				batchBytes += 22 + len(r.key) + len(r.value)
+			default:
+				break drain
+			}
+		}
+		flush()
+	}
+	flush()
+}
+
+func (w *WALWriter) writeBatchLocked(batch []walRequest) error {
+	for _, r := range batch {
+		record := WALRecord{
+			Type:  r.recordType,
+			Key:   r.key,
+			Value: r.value,
+		}
+		checksum := calculateChecksum(record)
+
+		var header [22]byte
+		header[0] = byte(record.Type)
+		header[1] = 0
+		binary.LittleEndian.PutUint64(header[2:10], w.seqNum)
+		binary.LittleEndian.PutUint32(header[10:14], uint32(len(r.key)))
+		binary.LittleEndian.PutUint32(header[14:18], uint32(len(r.value)))
+		binary.LittleEndian.PutUint32(header[18:22], checksum)
+
+		if _, err := w.bufWriter.Write(header[:]); err != nil {
+			return err
+		}
+		if len(r.key) > 0 {
+			if _, err := w.bufWriter.Write(r.key); err != nil {
+				return err
+			}
+		}
+		if len(r.value) > 0 {
+			if _, err := w.bufWriter.Write(r.value); err != nil {
+				return err
+			}
+		}
+
+		w.seqNum++
+		w.totalSize += int64(22 + len(r.key) + len(r.value))
+	}
+
+	if err := w.bufWriter.Flush(); err != nil {
+		return err
+	}
+	if w.syncOnWrite {
+		if err := w.file.Sync(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *WALWriter) Stats() map[string]interface{} {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var qlen int
+	var qcap int
+	if w.reqCh != nil {
+		qlen = len(w.reqCh)
+		qcap = cap(w.reqCh)
+	}
+	return map[string]interface{}{
+		"seq_num":               w.seqNum,
+		"total_size":            w.totalSize,
+		"sync_on_write":         w.syncOnWrite,
+		"queue_len":             qlen,
+		"queue_capacity":        qcap,
+		"queue_max_len":         w.queueMaxLen.Load(),
+		"enqueue_timeout_ms":    float64(time.Duration(w.enqueueTimeoutNanos.Load())) / float64(time.Millisecond),
+		"enqueue_count":         w.enqueueCount.Load(),
+		"enqueue_timeouts":      w.enqueueTimeouts.Load(),
+		"enqueue_wait_ms_total": float64(w.enqueueWaitNanos.Load()) / 1e6,
+		"enqueue_wait_ms_max":   float64(w.enqueueMaxWaitNanos.Load()) / 1e6,
+		"enqueue_wait_ms_avg":   ratioUint64(w.enqueueWaitNanos.Load()/1e6, w.enqueueCount.Load()),
+	}
 }
 
 // Rotate 轮转 WAL 文件
@@ -211,7 +381,7 @@ func (w *WALWriter) Rotate(newFilename string) error {
 	}
 
 	// 创建新文件
-	w.file, err = os.OpenFile(w.file.Name(), os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
+	w.file, err = os.OpenFile(w.file.Name(), os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}

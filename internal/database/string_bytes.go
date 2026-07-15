@@ -69,18 +69,125 @@ func (db *Database) SetStringBytes(key, value []byte) error {
 		db.updateMemoryUsage(memDelta)
 	}
 
-	if db.lsmEngine != nil {
+	if db.hasPersistence() {
 		dataBytes, err := dv.Serialize()
-		if err == nil {
-			if err := db.lsmEngine.Put(stringToBytesRO(k), dataBytes); err != nil {
-				logger.Error("Failed to write to LSM: %v", err)
+		if err != nil {
+			db.recordLSMError(err)
+			if db.persistenceWriteMode() == "weak" {
+				logger.Error("Failed to serialize value for key %s: %v", k, err)
+			} else {
+				return err
 			}
 		} else {
-			logger.Error("Failed to serialize value for key %s: %v", k, err)
+			if err := db.lsmPut(k, dataBytes); err != nil {
+				return err
+			}
 		}
 	}
 
 	return nil
+}
+
+func (db *Database) SetStringBytesWithOptions(key, value []byte, ttlMs int64, keepTTL bool, nx bool, xx bool) (bool, error) {
+	if nx && xx {
+		return false, fmt.Errorf("ERR syntax error")
+	}
+	if keepTTL && ttlMs != 0 {
+		return false, fmt.Errorf("ERR syntax error")
+	}
+	if !db.evictIfNeeded() {
+		return false, fmt.Errorf("OOM command not allowed when used memory (%d) > 'maxmemory' (%d)", atomic.LoadInt64(&db.usedMemory), db.maxMemory)
+	}
+
+	k := bytesToString(key)
+	shard := db.getShard(k)
+	nowMs := time.Now().UnixMilli()
+
+	var memDelta int64
+	var stableKey string
+	var dv *datastruct.DataValue
+
+	shard.lock.Lock()
+	if shard.data == nil {
+		shard.data = make(map[string]*datastruct.DataValue)
+	}
+
+	cur, exists := shard.data[k]
+	if exists && cur != nil && cur.IsExpired() {
+		delete(shard.data, k)
+		memDelta -= int64(len(k)) + cur.ApproximateSize()
+		cur = nil
+		exists = false
+	}
+
+	if nx && exists {
+		shard.lock.Unlock()
+		if memDelta != 0 {
+			db.updateMemoryUsage(memDelta)
+		}
+		return false, nil
+	}
+	if xx && !exists {
+		shard.lock.Unlock()
+		if memDelta != 0 {
+			db.updateMemoryUsage(memDelta)
+		}
+		return false, nil
+	}
+
+	b := make([]byte, len(value))
+	copy(b, value)
+
+	if exists && cur != nil && (cur.ExpireTime == 0 || nowMs <= cur.ExpireTime) {
+		oldSize := cur.ApproximateSize()
+		cur.Value = &datastruct.BytesString{Data: b}
+		if !keepTTL {
+			if ttlMs > 0 {
+				cur.ExpireTime = nowMs + ttlMs
+			} else {
+				cur.ExpireTime = 0
+			}
+		}
+		cur.LastAccessedAt = nowMs
+		memDelta += cur.ApproximateSize() - oldSize
+		stableKey = k
+		dv = cur
+	} else {
+		stableKey = strings.Clone(k)
+		expireAt := int64(0)
+		if ttlMs > 0 {
+			expireAt = nowMs + ttlMs
+		}
+		dv = &datastruct.DataValue{
+			Value:          &datastruct.BytesString{Data: b},
+			ExpireTime:     expireAt,
+			LastAccessedAt: nowMs,
+		}
+		shard.data[stableKey] = dv
+		memDelta += int64(len(stableKey)) + dv.ApproximateSize()
+	}
+	shard.lock.Unlock()
+
+	if memDelta != 0 {
+		db.updateMemoryUsage(memDelta)
+	}
+
+	if db.hasPersistence() {
+		dataBytes, err := dv.Serialize()
+		if err != nil {
+			db.recordLSMError(err)
+			if db.persistenceWriteMode() == "weak" {
+				logger.Error("Failed to serialize value for key %s: %v", stableKey, err)
+				return true, nil
+			}
+			return true, err
+		}
+		if err := db.lsmPut(stableKey, dataBytes); err != nil {
+			return true, err
+		}
+	}
+
+	return true, nil
 }
 
 func (db *Database) IncrStringBytes(key []byte) (int64, error) {
@@ -161,11 +268,18 @@ func (db *Database) incrByStringBytes(key []byte, delta int64) (int64, error) {
 		db.updateMemoryUsage(memDelta)
 	}
 
-	if db.lsmEngine != nil {
+	if db.hasPersistence() {
 		dataBytes, err := dv.Serialize()
-		if err == nil {
-			if err := db.lsmEngine.Put(stringToBytesRO(k), dataBytes); err != nil {
-				logger.Error("Failed to write to LSM: %v", err)
+		if err != nil {
+			db.recordLSMError(err)
+			if db.persistenceWriteMode() == "weak" {
+				logger.Error("Failed to serialize value for key %s: %v", k, err)
+			} else {
+				return 0, err
+			}
+		} else {
+			if err := db.lsmPut(k, dataBytes); err != nil {
+				return 0, err
 			}
 		}
 	}

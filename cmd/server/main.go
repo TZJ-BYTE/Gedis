@@ -3,6 +3,8 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -20,12 +22,17 @@ func main() {
 
 	cfg, err := config.LoadFromFile(*configPath)
 	if err != nil {
-		cfg = config.DefaultConfig()
+		if os.IsNotExist(err) {
+			cfg = config.DefaultConfig()
+		} else {
+			fmt.Fprintf(os.Stderr, "配置文件加载失败：%v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	// 初始化日志
 	if err := logger.Init(cfg.LogPath, cfg.LogLevel); err != nil {
-		fmt.Printf("初始化日志失败：%v\n", err)
+		fmt.Fprintf(os.Stderr, "初始化日志失败：%v\n", err)
 		os.Exit(1)
 	}
 
@@ -33,6 +40,14 @@ func main() {
 		logger.Warn("配置文件加载失败，已回退到默认配置：%v", err)
 	} else {
 		logger.Info("已加载配置文件：%s", *configPath)
+	}
+
+	if cfg.PprofEnabled {
+		go func() {
+			if err := http.ListenAndServe(cfg.PprofAddr, nil); err != nil {
+				logger.Warn("pprof server error: %v", err)
+			}
+		}()
 	}
 
 	logger.Info("正在启动 RediGo 服务器...")
@@ -45,7 +60,6 @@ func main() {
 	go func() {
 		if err := srv.Start(); err != nil {
 			logger.Error("服务器启动失败：%v", err)
-			fmt.Printf("服务器启动失败：%v\n", err)
 			os.Exit(1)
 		}
 	}()

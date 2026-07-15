@@ -132,7 +132,7 @@ func TestGC(t *testing.T) {
 			}
 		}
 		return false, nil
-	}, func(key, value []byte) error {
+	}, func(key, value []byte, oldVP *ValuePointer) error {
 		// Mock rewrite
 		t.Logf("Rewriting key: %s, value: %s", key, value)
 		return nil
